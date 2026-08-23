@@ -21,6 +21,7 @@ namespace Alife.Plugin.SystemEventBoost;
     - DeepSeek 峰谷模式：高峰时段自动停止自主活跃，节省资源
     - 勿扰模式：AI 自主活动但不打扰主人（禁止 speak/qchat 标签）
     - 撒娇模式：更粘人主动找主人，可联动桌宠吸引注意
+    - 倒计时挂件：在对话面板实时显示距下次自主活跃的倒计时（多角色各自一枚胶囊，悬停可看详情并"催一下"）
     全部模式可叠加同时生效，且可由 AI 通过自然语言自主开启/关闭。
     """,
     defaultCategory: "Doro的妙妙工具",
@@ -39,9 +40,11 @@ public class SystemEventBoostService(
     #region 运行时状态
 
     DateTime nextActivityTime;        // 下次自主活跃报点时间（周期/游戏/撒娇共用调度）
+    DateTime lastScheduleTime;        // 当前报点间隔的起点（挂件进度环用；仅周期类路径记录）
     DateTime? awakeReminderTime;      // Awake 定点报时时间
     string awakeReminderRemark = "";
     int continuousTimerCount;         // 连续触发次数（官方翻倍机制）
+    bool forceNextPoke;               // 主人手动催促：下次报点绕过高峰抑制
     DateTime? sleepUntil;             // 睡眠结束时间（null=未设置倒计时）
     bool sleepWaitForUser;            // 睡眠等待主人消息唤醒
     bool groupSilenceFlag;            // 本次Chat是否被睡眠静默占位改写（防误判唤醒）
@@ -96,25 +99,95 @@ public class SystemEventBoostService(
     public DateTime? AwakeTime => awakeReminderTime;
 
     /// <summary>当前调度状态描述（供 UI 显示报点类型/抑制原因）</summary>
-    public string ActivityStatus
+    public string ActivityStatus => ClassifyActivity().Text;
+
+    /// <summary>角色名（倒计时挂件注册键）</summary>
+    public string CharacterName => Character?.Name ?? "";
+
+    /// <summary>挂件状态码：period/sleep/work/game/cute/dnd/peak（决定挂件配色）</summary>
+    public string OverlayStateCode => ClassifyActivity().Code;
+
+    /// <summary>模式优先级判定（ActivityStatus 与 OverlayStateCode 的统一来源，避免两份逻辑改一处漏一处）</summary>
+    (string Code, string Text) ClassifyActivity()
     {
-        get
-        {
-            if (IsWorkModeActive)
-                return $"工作模式·{workPhase}";
-            if (IsSleeping)
-                return sleepWaitForUser ? "睡眠中·等待主人消息" : "睡眠中·倒计时中";
-            if (Configuration.MasterPeakMode && Configuration.PeakModeEnabled && IsPeakHour(DateTime.Now))
-                return "高峰时段·自主活跃已暂停";
-            if (IsGameModeActive)
-                return "游戏陪伴";
-            if (IsCuteModeActive && !IsDndActive)
-                return "撒娇";
-            if (IsDndActive)
-                return "勿扰";
-            return "周期报点";
-        }
+        if (IsWorkModeActive)
+            return ("work", $"工作模式·{workPhase}");
+        if (IsSleeping)
+            return ("sleep", sleepWaitForUser ? "睡眠中·等待主人消息" : "睡眠中·倒计时中");
+        if (Configuration.MasterPeakMode && Configuration.PeakModeEnabled && IsPeakHour(DateTime.Now))
+            return ("peak", "高峰时段·自主活跃已暂停");
+        if (IsGameModeActive)
+            return ("game", "游戏陪伴");
+        if (IsCuteModeActive && !IsDndActive)
+            return ("cute", "撒娇");
+        if (IsDndActive)
+            return ("dnd", "勿扰");
+        return ("period", "周期报点");
     }
+
+    /// <summary>挂件『催一下』：立即触发一次自主活跃（用户主动操作优先于各模式压制）</summary>
+    public void TriggerActivityNow()
+    {
+        if (IsSleeping)
+        {
+            WakeUp(silent: false);
+            Console.WriteLine($"[主动事件增强] 挂件催一下：唤醒睡眠角色 [{CharacterName}]");
+            return;
+        }
+
+        if (IsWorkModeActive)
+        {
+            //工作模式下不抢调度，改为催促当前步骤进度
+            interactor.Poke("(主人在挂件上点了「催促进度」：请汇报当前步骤进展，或尽快完成当前步骤后继续)");
+            Console.WriteLine($"[主动事件增强] 挂件催一下：[{CharacterName}] 工作模式中，已发送催促");
+            return;
+        }
+
+        //高峰抑制场景：置绕过标记（仅当当前确实被抑制，避免标记残留到之后的高峰期造成计划外报点）
+        if (Configuration.MasterPeakMode && Configuration.PeakModeEnabled && IsPeakHour(DateTime.Now))
+            forceNextPoke = true;
+        nextActivityTime = DateTime.Now;
+        lastScheduleTime = DateTime.Now;
+        Console.WriteLine($"[主动事件增强] 挂件催一下：[{CharacterName}] 下次自主活跃已置为现在");
+    }
+
+    /// <summary>设置该角色的倒计时胶囊显示/隐藏（挂件详情卡与设置页开关共用同一状态，立即生效并落盘）</summary>
+    public void SetOverlayVisible(bool visible)
+    {
+        if (Configuration.ShowCountdownOverlay == visible)
+            return;
+        Configuration.ShowCountdownOverlay = visible;
+        SaveConfig();
+        Console.WriteLine($"[主动事件增强] 挂件：[{CharacterName}] 倒计时胶囊已{(visible ? "显示" : "隐藏")}");
+    }
+
+    /// <summary>设置胶囊自由位置（null=归位编组）。随角色配置持久化，重启 Alife 保留。</summary>
+    public void SetOverlayPillPosition(double? x, double? y)
+    {
+        Configuration.OverlayPillX = x;
+        Configuration.OverlayPillY = y;
+        SaveConfig();
+        Console.WriteLine($"[主动事件增强] 挂件位置已保存：[{CharacterName}] " + (x == null ? "归位" : $"({x:0},{y:0})"));
+    }
+
+    /// <summary>构建挂件展示快照（HTTP /state 数据源；时间用 epoch 毫秒，挂件端只做差值不受时钟同步影响）</summary>
+    public OverlayCharSnapshot BuildOverlaySnapshot() => new()
+    {
+        Name = CharacterName,
+        StateCode = OverlayStateCode,
+        StateText = ActivityStatus,
+        NextMs = new DateTimeOffset(NextActivityTime).ToUnixTimeMilliseconds(),
+        IntervalStartMs = new DateTimeOffset(lastScheduleTime).ToUnixTimeMilliseconds(),
+        IntervalEndMs = new DateTimeOffset(NextActivityTime).ToUnixTimeMilliseconds(),
+        SleepEndMs = SleepEndTime == null ? null : new DateTimeOffset(SleepEndTime.Value).ToUnixTimeMilliseconds(),
+        SleepAwaitingUser = SleepAwaitingUser,
+        WorkStep = CurrentWorkStep,
+        WorkTotal = TotalWorkSteps,
+        WorkTask = CurrentWorkTask,
+        AwakeMs = AwakeTime == null ? null : new DateTimeOffset(AwakeTime.Value).ToUnixTimeMilliseconds(),
+        FreeX = Configuration.OverlayPillX,
+        FreeY = Configuration.OverlayPillY,
+    };
 
     #endregion
 
@@ -133,6 +206,7 @@ public class SystemEventBoostService(
     {
         lastUserInteractionTime = DateTime.Now;
         nextActivityTime = DateTime.Now;
+        lastScheduleTime = DateTime.Now;
         awakeReminderTime = null;
 
         //按模式总开关过滤可用函数：关闭的模式不暴露给 AI
@@ -225,6 +299,9 @@ public class SystemEventBoostService(
             }
         }
 
+        //对话面板倒计时挂件：注册实例（可见性由管理器按配置实时判断，多角色共享一个本地服务与挂件）
+        CountdownOverlayManager.Register(this);
+
         return Task.CompletedTask;
     }
 
@@ -237,6 +314,7 @@ public class SystemEventBoostService(
         TickAwakeReminder();
         TickScheduledTasks();
         TickActivity();
+        _ = CountdownOverlayManager.EnsureAsync();   //挂件注入自愈（内部全局节流；无注册实例时不动作）
         return Task.CompletedTask;
     }
 
@@ -246,6 +324,8 @@ public class SystemEventBoostService(
         ChatBot.ChatSend -= OnChatSend;
         ChatBot.ChatReceived -= OnChatReceived;
         ChatBot.ChatFinishedAsync -= OnChatFinishedAsync;
+
+        CountdownOverlayManager.Unregister(this);
 
         await interactor.ChatAsync($"程序关闭中。{Configuration.DestroyPrompt}");
     }
@@ -536,6 +616,7 @@ public class SystemEventBoostService(
         if (Configuration.MasterScheduledTask == false)
             return; //定时任务总开关关闭，不触发任何任务
 
+        bool dirty = false;
         foreach (ScheduledTask task in Configuration.ScheduledTasks)
         {
             if (task.Enabled == false)
@@ -546,14 +627,23 @@ public class SystemEventBoostService(
             bool due = false;
             if (task.Type == ScheduledTaskType.Recurring)
             {
+                //按"当日计划时刻已到且今天未触发"判断（非精确分钟匹配）：
+                //卡顿/重启错过触发分钟时，30 分钟宽限期内补触发；超宽限视为已过，防止晚启动意外补触发
                 DateTime now = DateTime.Now;
-                if (now.Hour == task.Hour && now.Minute == task.Minute && task.IsDayMatched(now.DayOfWeek))
+                string todayKey = now.ToString("yyyyMMdd");
+                if (task.LastTriggerDate != todayKey && task.IsDayMatched(now.DayOfWeek))
                 {
-                    string todayKey = now.ToString("yyyyMMdd");
-                    if (task.LastTriggerDate != todayKey)
+                    DateTime scheduled = now.Date.AddHours(task.Hour).AddMinutes(task.Minute);
+                    if (now >= scheduled && now < scheduled.AddMinutes(30))
                     {
                         task.LastTriggerDate = todayKey;
                         due = true;
+                        dirty = true;
+                    }
+                    else if (now >= scheduled.AddMinutes(30))
+                    {
+                        task.LastTriggerDate = todayKey; //已超宽限：标记今日已过，避免反复判断与补触发
+                        dirty = true;
                     }
                 }
             }
@@ -561,11 +651,16 @@ public class SystemEventBoostService(
             {
                 task.Enabled = false; //一次性任务触发后自动禁用
                 due = true;
+                dirty = true;
             }
 
             if (due)
                 interactor.Poke($"[定时任务:{task.Name}] {task.Message}");
         }
+
+        //触发状态落盘：防重标记与一次性任务禁用跨重启生效
+        if (dirty)
+            SaveConfig();
     }
 
     #endregion
@@ -604,30 +699,33 @@ public class SystemEventBoostService(
         if (string.IsNullOrEmpty(text))
         {
             nextActivityTime = DateTime.Now.Add(interval); //高峰抑制等：不Poke，稍后重查
+            lastScheduleTime = DateTime.Now;
             return;
         }
 
         if (functionService.IsIdle == false)
         {
             nextActivityTime = DateTime.Now.Add(interval); //与AI活动碰撞，延迟重试
+            lastScheduleTime = DateTime.Now;
             return;
         }
 
         interactor.Poke(text);
         continuousTimerCount++;
         nextActivityTime = DateTime.Now.Add(interval);
+        lastScheduleTime = DateTime.Now;
     }
 
     /// <summary>按优先级叠加各模式，合成当前自主活跃的间隔与提示文本</summary>
     (TimeSpan Interval, string? Text) ComposeActivity()
     {
-        // ---- 峰谷模式：高峰时段停止自主活跃 ----
-        if (Configuration.MasterPeakMode && Configuration.PeakModeEnabled && IsPeakHour(DateTime.Now))
-        {
-            if (Configuration.PeakSuppressGameMode || IsGameModeActive == false)
-                return (TimeSpan.FromMinutes(5), null); //自主活跃暂停，5分钟后重查
-            //不抑制游戏陪伴时，继续按游戏模式逻辑
-        }
+        // ---- 峰谷模式：高峰时段停止自主活跃（主人手动催促时绕过一次） ----
+        bool peakActive = Configuration.MasterPeakMode && Configuration.PeakModeEnabled && IsPeakHour(DateTime.Now);
+        if (peakActive && forceNextPoke)
+            forceNextPoke = false;
+        else if (peakActive && (Configuration.PeakSuppressGameMode || IsGameModeActive == false))
+            return (TimeSpan.FromMinutes(5), null); //自主活跃暂停，5分钟后重查
+        //不抑制游戏陪伴时，继续按游戏模式逻辑
 
         // ---- 游戏陪伴模式：固定间隔 ----
         if (IsGameModeActive)
@@ -699,6 +797,7 @@ public class SystemEventBoostService(
     {
         nextActivityTime = DateTime.Now.AddSeconds(GetNextInterval(continuousTimerCount,
             Random.Shared.Next(-Configuration.UpdateRandomOffset, Configuration.UpdateRandomOffset)));
+        lastScheduleTime = DateTime.Now;
     }
 
     /// <summary>是否处于高峰时段（固定按北京时间 UTC+8 判断，不依赖系统时区）</summary>
@@ -720,6 +819,7 @@ public class SystemEventBoostService(
         Configuration.GamePokeIntervalSeconds = Math.Max(10, intervalSeconds);
         SaveConfig();
         nextActivityTime = DateTime.Now.AddSeconds(Math.Max(10, intervalSeconds));
+        lastScheduleTime = DateTime.Now;
         interactor.Poke($"(已进入游戏陪伴模式，将每 {Configuration.GamePokeIntervalSeconds} 秒主动查看一次游戏画面陪伴主人)");
     }
 
@@ -794,6 +894,7 @@ public class SystemEventBoostService(
             Configuration.CuteMinIntervalSeconds = Math.Max(20, minIntervalSeconds.Value);
         SaveConfig();
         nextActivityTime = DateTime.Now.AddSeconds(Configuration.CuteMinIntervalSeconds);
+        lastScheduleTime = DateTime.Now;
         interactor.Poke($"(已开启撒娇模式，将更主动地粘着主人！最短活跃间隔 {Configuration.CuteMinIntervalSeconds} 秒)");
     }
 

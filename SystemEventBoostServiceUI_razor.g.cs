@@ -16,7 +16,7 @@ namespace Alife.Plugin.SystemEventBoost;
 /// 主动事件增强版 配置面板（手写 Razor 编译产物风格 UI）
 /// 通过 ModuleUIBase 获取 Configuration，修改后由客户端底部的保存栏统一持久化。
 /// </summary>
-public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostService, SystemEventBoostServiceConfig>
+public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostService, SystemEventBoostServiceConfig>, IDisposable
 {
     // ========== 定时任务新增表单 ==========
     bool _taskIsRecurring = true;
@@ -388,6 +388,28 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             __builder.AddContent(s++, $"定点报时 {awakeTime:HH:mm}");
             __builder.CloseElement();
         }
+        // 倒计时挂件开关（显示/隐藏对话面板挂件；关闭立即生效，重新开启会恢复显示，包括在挂件内手动隐藏的情况）
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;margin-top:8px;background:#fff5fa;border:1px solid #ffe3f0;border-radius:12px;");
+        __builder.OpenElement(s++, "div");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;font-size:13px;");
+        __builder.AddContent(s++, "💬 倒计时挂件");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-size:11px;color:#c48aa5;");
+        __builder.AddContent(s++, "拨动立即生效；保存后持久化。在挂件详情卡内也可隐藏");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, Configuration?.ShowCountdownOverlay ?? true, v =>
+        {
+            if (Configuration == null) return;
+            Configuration.ShowCountdownOverlay = v;
+            //立即推送到运行中的模块实例（挂件 1 秒内显示/隐藏，无需保存或重启角色；保存栏负责持久化）
+            if (SafeModule is IConfigurable configurable)
+                configurable.Configuration = Configuration;
+        });
+        __builder.CloseElement();
         __builder.CloseElement();
         __builder.CloseElement();
         __builder.CloseElement();

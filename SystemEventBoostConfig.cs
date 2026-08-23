@@ -304,4 +304,27 @@ public class SystemEventBoostServiceConfig
         "<python/>写代码跑脚本、<process/>执行进程、<file/>读写文件、<browser/>操作浏览器、<smartwebsearch/>上网搜索、<skill/>加载技能、<AlifeMcp/>平台控制";
 
     #endregion
+
+    #region 倒计时挂件（对话面板）
+
+    /// <summary>
+    /// 在对话面板显示距下次自主活跃的倒计时挂件：
+    /// 每个已激活角色一枚胶囊（状态色 + 倒计时），悬停展开详情卡（下次活跃时刻/间隔进度/睡眠/工作），
+    /// 卡内可"催一下"立即触发活跃；多角色共享一个挂件自动堆叠，并与其它插件的挂件避让。
+    /// </summary>
+    public bool ShowCountdownOverlay { get; set; } = true;
+
+    /// <summary>挂件本地 HTTP 服务起始端口（被占用时自动向后扫描，共 20 个；避开 TokenStats 的 18790 段）</summary>
+    public int OverlayHttpPort { get; set; } = 18810;
+
+    /// <summary>挂件与相邻元素（『展开思考』开关、其它插件挂件）的间距（像素）</summary>
+    public int OverlayGap { get; set; } = 10;
+
+    /// <summary>倒计时胶囊的自由摆放位置 X（像素；null=编组锚定）。拖动胶囊后自动保存，重启 Alife 保留。</summary>
+    public double? OverlayPillX { get; set; }
+
+    /// <summary>倒计时胶囊的自由摆放位置 Y（像素；null=编组锚定）</summary>
+    public double? OverlayPillY { get; set; }
+
+    #endregion
 }
