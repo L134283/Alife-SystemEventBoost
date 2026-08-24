@@ -35,7 +35,31 @@ public class SystemEventBoostService(
     ChatBehaviour,
     IConfigurable<SystemEventBoostServiceConfig>
 {
-    public SystemEventBoostServiceConfig Configuration { get; set; } = null!;
+    SystemEventBoostServiceConfig _configuration = null!;
+    public SystemEventBoostServiceConfig Configuration
+    {
+        get => _configuration;
+        set
+        {
+            SystemEventBoostServiceConfig old = _configuration;
+            _configuration = value;
+            // UI 面板保存配置后,框架直接替换 Configuration 对象(热应用),但模块实例不会重建、
+            // OnStart 不会重跑,nextActivityTime 等调度状态仍停留在旧配置计算的时刻:
+            // 挂件倒计时与实际间隔不符,且要等旧报点时刻到达才恢复(期间反复改配置也一直不对)。
+            // 这里检测调度相关配置的变化,立即按新配置重新对齐下次活跃时间。
+            if (old != null && old != value && IsStarted && SchedulingConfigChanged(old, value))
+            {
+                try
+                {
+                    ResetScheduling();
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "配置变更后重置调度失败");
+                }
+            }
+        }
+    }
 
     #region 运行时状态
 
@@ -712,7 +736,11 @@ public class SystemEventBoostService(
 
         interactor.Poke(text);
         continuousTimerCount++;
-        nextActivityTime = DateTime.Now.Add(interval);
+        //用递增后的连续次数重新合成下次间隔：
+        //报点 N 完成后，下一次报点直接按「已连续触发 N 次」翻倍，而不是等 N+1 次报点才翻倍
+        //(旧逻辑用递增前的 count 设置 next，导致报点事件间隔恒为基础间隔，翻倍延迟一次报点)
+        (TimeSpan nextInterval, _) = ComposeActivity();
+        nextActivityTime = DateTime.Now.Add(nextInterval);
         lastScheduleTime = DateTime.Now;
     }
 
@@ -1330,6 +1358,63 @@ public class SystemEventBoostService(
         string[] names = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
         var days = Enumerable.Range(0, 7).Where(i => (bits & (1 << i)) != 0).Select(i => names[i]);
         return string.Join("、", days);
+    }
+
+    /// <summary>
+    /// 配置热应用后按新配置重新对齐调度状态:
+    /// 重置连续触发计数并按当前模式用新配置计算下次活跃时刻,
+    /// 让挂件倒计时立即与新间隔同步(而非等旧报点时刻到达)。
+    /// </summary>
+    void ResetScheduling()
+    {
+        continuousTimerCount = 0;
+        if (IsSleeping)
+        {
+            nextActivityTime = DateTime.Now.AddSeconds(10); //睡眠期间由 TickActivity 持续轮询刷新
+            lastScheduleTime = DateTime.Now;
+            return;
+        }
+        if (IsWorkModeActive)
+        {
+            nextActivityTime = DateTime.Now.AddSeconds(5);
+            lastScheduleTime = DateTime.Now;
+            return;
+        }
+        (TimeSpan interval, _) = ComposeActivity();
+        nextActivityTime = DateTime.Now.Add(interval);
+        lastScheduleTime = DateTime.Now;
+        Console.WriteLine($"[主动事件增强] 配置变更，调度已按新配置对齐：[{CharacterName}] 下次活跃 {interval.TotalSeconds:0} 秒后");
+    }
+
+    /// <summary>判断两次配置对象是否在"影响调度/挂件时间"的字段上有差异(避免无关配置改动触发重新调度)</summary>
+    static bool SchedulingConfigChanged(SystemEventBoostServiceConfig a, SystemEventBoostServiceConfig b)
+    {
+        return a.UpdateInterval != b.UpdateInterval
+            || a.UpdateRandomOffset != b.UpdateRandomOffset
+            || a.UpdateIntervalMultiplier != b.UpdateIntervalMultiplier
+            || a.UpdateMaxRetryCount != b.UpdateMaxRetryCount
+            || a.MasterGameMode != b.MasterGameMode || a.GameModeEnabled != b.GameModeEnabled
+            || a.GamePokeIntervalSeconds != b.GamePokeIntervalSeconds
+            || a.MasterCuteMode != b.MasterCuteMode || a.CuteModeEnabled != b.CuteModeEnabled
+            || a.CuteMinIntervalSeconds != b.CuteMinIntervalSeconds
+            || a.MasterDndMode != b.MasterDndMode || a.DndModeEnabled != b.DndModeEnabled
+            || a.MasterPeakMode != b.MasterPeakMode || a.PeakModeEnabled != b.PeakModeEnabled
+            || a.PeakSuppressGameMode != b.PeakSuppressGameMode
+            || PeakHoursChanged(a.PeakHours, b.PeakHours);
+    }
+
+    static bool PeakHoursChanged(List<TimeRange>? a, List<TimeRange>? b)
+    {
+        if (a == null || b == null)
+            return a != b;
+        if (a.Count != b.Count)
+            return true;
+        for (int i = 0; i < a.Count; i++)
+        {
+            if (a[i].StartHour != b[i].StartHour || a[i].EndHour != b[i].EndHour)
+                return true;
+        }
+        return false;
     }
 
     void SaveConfig()
