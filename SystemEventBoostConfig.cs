@@ -150,6 +150,17 @@ public class SystemEventBoostServiceConfig
 
     #endregion
 
+    #region 群聊互动
+
+    /// <summary>
+    /// 收到群聊消息时是否重置周期报点倒计时（默认开启）。
+    /// 开启：群聊消息与主人对话一样，重置连续触发计数并重新计算下次报点时刻（睡眠中除外，避免群消息打断睡眠）；
+    /// 关闭：只有主人对话会重置倒计时，群聊消息不打断自主活跃节奏。
+    /// </summary>
+    public bool ResetCountdownOnGroupMessage { get; set; } = true;
+
+    #endregion
+
     #region 注入设置
 
     /// <summary>
@@ -250,6 +261,13 @@ public class SystemEventBoostServiceConfig
         new() { StartHour = 9, EndHour = 12 },
         new() { StartHour = 14, EndHour = 18 },
     ];
+
+    /// <summary>
+    /// 峰谷机制生效的星期位图（bit0=周日, bit1=周一 … bit6=周六）。
+    /// 默认周一至周五开启、周六日关闭；用户可在配置面板逐日自由开关。
+    /// </summary>
+    public int PeakDayBits { get; set; } = (1 << (int)DayOfWeek.Monday) | (1 << (int)DayOfWeek.Tuesday)
+        | (1 << (int)DayOfWeek.Wednesday) | (1 << (int)DayOfWeek.Thursday) | (1 << (int)DayOfWeek.Friday);
 
     #endregion
 

@@ -487,6 +487,28 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         __builder.CloseElement();
 
+        // 群聊消息重置倒计时
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-card");
+        __builder.AddAttribute(s++, "style", "margin-top:14px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "flex:1;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;");
+        __builder.AddContent(s++, "群聊消息重置倒计时");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
+        __builder.AddContent(s++, "开启：收到群聊消息也视为互动，重置周期报点倒计时并重新计算下次报点（睡眠中除外，避免群消息打断睡眠）；关闭：只有主人对话会重置，群聊消息不打断自主活跃节奏。");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, Configuration.ResetCountdownOnGroupMessage, v => Configuration.ResetCountdownOnGroupMessage = v);
+        __builder.CloseElement();
+        __builder.CloseElement();
+
         // 注入设置
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
@@ -1000,6 +1022,29 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         RenderSwitch(__builder, ref s, Configuration.PeakSuppressGameMode, v => Configuration.PeakSuppressGameMode = v);
         __builder.CloseElement();
+        // 生效星期（默认周一至周五，周六日关闭，可逐日自由开关）
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "margin-top:12px;");
+        __builder.OpenElement(s++, "span");
+        __builder.AddAttribute(s++, "class", "seb-label");
+        __builder.AddContent(s++, "生效星期（点击开关）");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "display:flex;gap:6px;margin-top:4px;");
+        RenderPeakDayToggle(__builder, ref s, "周一", DayOfWeek.Monday);
+        RenderPeakDayToggle(__builder, ref s, "周二", DayOfWeek.Tuesday);
+        RenderPeakDayToggle(__builder, ref s, "周三", DayOfWeek.Wednesday);
+        RenderPeakDayToggle(__builder, ref s, "周四", DayOfWeek.Thursday);
+        RenderPeakDayToggle(__builder, ref s, "周五", DayOfWeek.Friday);
+        RenderPeakDayToggle(__builder, ref s, "周六", DayOfWeek.Saturday);
+        RenderPeakDayToggle(__builder, ref s, "周日", DayOfWeek.Sunday);
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:6px 0 0 0;");
+        __builder.AddContent(s++, "只在这些星期内生效高峰时段抑制；未开启的星期任何时段都不算高峰。");
+        __builder.CloseElement();
+        __builder.CloseElement();
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "margin-top:12px;");
         __builder.OpenElement(s++, "span");
@@ -1239,6 +1284,24 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         b.AddContent(s++, label);
         b.CloseElement();
         RenderSwitch(b, ref s, value, setter);
+        b.CloseElement();
+    }
+
+    /// <summary>峰谷生效星期按钮（点击开关，bit 位图与 ScheduledTask 一致：bit0=周日…bit6=周六）</summary>
+    void RenderPeakDayToggle(RenderTreeBuilder b, ref int s, string label, DayOfWeek day)
+    {
+        bool on = (Configuration.PeakDayBits & (1 << (int)day)) != 0;
+        b.OpenElement(s++, "div");
+        b.AddAttribute(s++, "style",
+            "flex:1;text-align:center;padding:6px 2px;border-radius:10px;cursor:pointer;border:1px solid " +
+            (on ? "#ec4899" : "#ffe3f0") + ";background:" + (on ? "#fdeef6" : "#fff5fa") + ";color:" +
+            (on ? "#ec4899" : "#c48aa5") + ";font-weight:" + (on ? 700 : 500) + ";font-size:12px;");
+        b.AddAttribute(s++, "onclick", () =>
+        {
+            Configuration.PeakDayBits ^= (1 << (int)day);
+            StateHasChanged();
+        });
+        b.AddContent(s++, label);
         b.CloseElement();
     }
 

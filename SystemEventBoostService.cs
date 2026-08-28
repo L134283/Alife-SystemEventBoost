@@ -265,7 +265,7 @@ public class SystemEventBoostService(
         if (Configuration.MasterDndMode)
             detail.AppendLine("- 勿扰：自主活动但禁止 speak/qchat 等打扰标签，可按「允许做的事」清单自娱自乐");
         if (Configuration.MasterPeakMode)
-            detail.AppendLine("- 峰谷：高峰时段（北京时间 9-12/14-18）自动暂停自主活跃，空闲时段恢复");
+            detail.AppendLine("- 峰谷：高峰时段（默认北京时间 9-12/14-18、周一至周五）自动暂停自主活跃，空闲时段恢复");
         if (Configuration.MasterCuteMode)
             detail.AppendLine("- 撒娇：长时间无互动会自动拉长活跃间隔，避免频繁空转烧 token");
         if (Configuration.MasterWorkMode)
@@ -363,8 +363,25 @@ public class SystemEventBoostService(
         bool isSilencedGroup = groupSilenceFlag;
         groupSilenceFlag = false;
 
-        if (message.Contains(ChatBot.PokeMessageTag) || isSilencedGroup)
-            return; //系统报点/被静默的群聊消息，不视为真实互动
+        bool isPoke = message.Contains(ChatBot.PokeMessageTag);
+        bool isGroup = IsGroupPokeMessage(message);
+
+        //系统报点 / 被睡眠静默的群聊消息：不视为真实互动
+        if (isPoke && !isGroup)
+            return;
+        if (isSilencedGroup)
+            return;
+
+        //群聊消息：是否重置周期报点由开关控制（默认开启；睡眠中不重置，避免群消息打断睡眠）
+        if (isGroup)
+        {
+            if (Configuration.ResetCountdownOnGroupMessage == false || IsSleeping)
+                return;
+            continuousTimerCount = 0;
+            lastUserInteractionTime = DateTime.Now;
+            NextActivity();
+            return;
+        }
 
         //真实用户消息（主人对话）：重置周期报点 + 记录互动 + 唤醒睡眠
         continuousTimerCount = 0;
@@ -828,11 +845,14 @@ public class SystemEventBoostService(
         lastScheduleTime = DateTime.Now;
     }
 
-    /// <summary>是否处于高峰时段（固定按北京时间 UTC+8 判断，不依赖系统时区）</summary>
+    /// <summary>是否处于高峰时段（按北京时间 UTC+8 判断星期与小时，不依赖系统时区）</summary>
     bool IsPeakHour(DateTime now)
     {
-        int bjHour = now.ToUniversalTime().AddHours(8).Hour;
-        return Configuration.PeakHours.Any(range => range.Contains(bjHour));
+        DateTime bj = now.ToUniversalTime().AddHours(8);
+        //星期过滤：未开启的星期任何时段都不算高峰（默认周一至周五）
+        if ((Configuration.PeakDayBits & (1 << (int)bj.DayOfWeek)) == 0)
+            return false;
+        return Configuration.PeakHours.Any(range => range.Contains(bj.Hour));
     }
 
     #endregion
@@ -937,7 +957,7 @@ public class SystemEventBoostService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("切换DeepSeek峰谷模式：高峰时段（默认北京时间9-12点、14-18点）自动停止自主活跃以节省资源。")]
+    [Description("切换DeepSeek峰谷模式：高峰时段（默认北京时间9-12点、14-18点，周一至周五）自动停止自主活跃以节省资源。")]
     public void SetPeakMode(bool enabled)
     {
         Configuration.PeakModeEnabled = enabled;
@@ -1400,6 +1420,7 @@ public class SystemEventBoostService(
             || a.MasterDndMode != b.MasterDndMode || a.DndModeEnabled != b.DndModeEnabled
             || a.MasterPeakMode != b.MasterPeakMode || a.PeakModeEnabled != b.PeakModeEnabled
             || a.PeakSuppressGameMode != b.PeakSuppressGameMode
+            || a.PeakDayBits != b.PeakDayBits
             || PeakHoursChanged(a.PeakHours, b.PeakHours);
     }
 
