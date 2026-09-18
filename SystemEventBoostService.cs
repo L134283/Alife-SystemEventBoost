@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
 using Alife.Function.FunctionCaller;
@@ -75,6 +76,19 @@ public class SystemEventBoostService(
     bool wasSleeping;                 // 上一次检测的睡眠状态（用于睡眠结束时的唤醒提示）
     DateTime lastUserInteractionTime; // 最近真实互动时间（撒娇智能节流）
 
+    // ===== 自有周期循环 + 框架循环看门狗 =====
+    // 框架的 ChatActivity.StartTimer 是"边遍历 container.Instances 边 await 各模块 UpdateAsync"，
+    // 而插件加载/卸载、角色配置变更会在别的线程就地增删同一个集合，撞上就抛
+    // "Collection was modified; enumeration operation may not execute"，被外层 catch 吞掉后
+    // 该角色的更新循环永久停止且永不重启：所有模块 OnUpdate 停摆，重载插件后新建的模块也永远等不到 OnStart
+    //（表现为：报点不再触发、重载插件后挂件消失且不恢复、桌宠等模块失去 OnStart 初始化）。
+    // 本插件的周期工作与挂件自愈因此改用自有循环，并在框架循环停摆时给出明确告警。
+    DateTime lastTickSeenTime;         // 框架更新循环最后一次调用本模块 OnUpdate 的时间
+    bool frameworkStarted;             // 框架是否调用过 OnStart（框架循环只由 ChatActivity.Start 启动）
+    bool frameworkStalled;             // 判定：框架更新循环已停止
+    DateTime loopStartedTime;          // 自有循环启动时间
+    CancellationTokenSource? loopCts;  // 自有循环的取消源
+
     // ===== 工作模式运行时状态 =====
     WorkPhase workPhase;              // 工作模式阶段
     string workTask = "";             // 当前工作任务描述
@@ -134,6 +148,9 @@ public class SystemEventBoostService(
     /// <summary>模式优先级判定（ActivityStatus 与 OverlayStateCode 的统一来源，避免两份逻辑改一处漏一处）</summary>
     (string Code, string Text) ClassifyActivity()
     {
+        //框架更新循环已停止：本插件靠自有循环仍在工作，但调度/报点已不可靠，给出明确状态而不是静默停摆
+        if (frameworkStalled)
+            return ("stall", "框架更新循环已停止·请停用后重新激活");
         if (IsWorkModeActive)
             return ("work", $"工作模式·{workPhase}");
         if (IsSleeping)
@@ -223,6 +240,15 @@ public class SystemEventBoostService(
         ChatBot.ChatSend += OnChatSend;
         ChatBot.ChatReceived += OnChatReceived;
         ChatBot.ChatFinishedAsync += OnChatFinishedAsync;
+
+        //挂件注册 + 自有周期循环都放在唤醒阶段：框架更新循环若已停止（见字段注释），OnStart 永远不会被调用，
+        //把注册放在 OnStart 会导致"重载插件后挂件再也不出现"
+        lastUserInteractionTime = DateTime.Now;
+        nextActivityTime = DateTime.Now;
+        lastScheduleTime = DateTime.Now;
+        lastTickSeenTime = DateTime.Now;
+        CountdownOverlayManager.Register(this);
+        StartLoop();
         return Task.CompletedTask;
     }
 
@@ -323,23 +349,101 @@ public class SystemEventBoostService(
             }
         }
 
-        //对话面板倒计时挂件：注册实例（可见性由管理器按配置实时判断，多角色共享一个本地服务与挂件）
-        CountdownOverlayManager.Register(this);
+        //对话面板倒计时挂件已在 OnAwake 注册（不依赖框架更新循环）
 
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// 框架每秒回调：这里只做看门狗。
+    /// 周期工作（报点/定时任务/睡眠/工作模式）与挂件自愈都已经搬进自有循环（见 <see cref="StartLoop"/>），
+    /// 这样即使框架的更新循环因并发修改容器异常而永久停止，本插件仍能正常工作。
+    /// </summary>
     protected override Task OnUpdate()
     {
-        if (UpdateContext.FrameCount % (int)(1 / UpdateContext.ExpectedDeltaTime) != 0)
-            return Task.CompletedTask;
-
-        TickWorkMode();
-        TickAwakeReminder();
-        TickScheduledTasks();
-        TickActivity();
-        _ = CountdownOverlayManager.EnsureAsync();   //挂件注入自愈（内部全局节流；无注册实例时不动作）
+        frameworkStarted = true;
+        lastTickSeenTime = DateTime.Now;
+        frameworkStalled = false;   //框架循环在跑（例如角色重新激活后），清掉告警状态
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 本插件自有周期循环（1 秒一次，随实例生命周期启停）。
+    /// 不用框架的 Update 回调是因为它可能永久停止：框架 ChatActivity.StartTimer 边遍历 container.Instances
+    /// 边 await 各模块 UpdateAsync，而插件加载/卸载与角色配置变更会在别的线程就地增删该集合，
+    /// 撞上就抛 Collection was modified 并被外层 catch 吞掉 → 该角色的更新循环停止且永不重启。
+    /// 后果是：所有模块不再被更新，且此后新建的模块永远等不到 OnStart（重载插件后挂件消失即此因）。
+    /// </summary>
+    void StartLoop()
+    {
+        CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(DestroyCancellationToken);
+        loopCts = cts;
+        loopStartedTime = DateTime.Now;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (cts.IsCancellationRequested == false)
+                {
+                    await Task.Delay(1000, cts.Token);
+                    try
+                    {
+                        //框架启动回调跑过之后再开始调度/报点，避免在角色激活过程中插话
+                        if (frameworkStarted)
+                        {
+                            TickWorkMode();
+                            TickAwakeReminder();
+                            TickScheduledTasks();
+                            TickActivity();
+                        }
+                        CheckFrameworkStall();
+                        _ = CountdownOverlayManager.EnsureAsync();   //挂件自愈（心跳驱动，稳态 0 次 IPC）
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "主动事件增强：周期循环单次执行失败");
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "主动事件增强：周期循环退出");
+            }
+        });
+    }
+
+    /// <summary>
+    /// 框架更新循环看门狗：发现它停摆就明确告警（本插件仍能工作，但其它模块不会恢复，需要重新激活角色）。
+    /// 判定一：OnStart 跑过却长时间收不到 OnUpdate（循环在运行中被打断）；
+    /// 判定二：唤醒后长时间收不到 OnStart（循环在插件重载前就已停止）。
+    /// </summary>
+    void CheckFrameworkStall()
+    {
+        if (frameworkStalled)
+            return;
+
+        if (frameworkStarted)
+        {
+            double idle = (DateTime.Now - lastTickSeenTime).TotalSeconds;
+            if (idle > 15)
+            {
+                frameworkStalled = true;
+                Console.WriteLine($"[主动事件增强][警告] 角色 [{CharacterName}] 的框架更新循环已停止（{idle:0} 秒未收到更新回调），"
+                    + "通常由插件加载/卸载或角色配置变更与框架遍历容器并发冲突（Collection was modified）导致。"
+                    + "本插件已改用自有循环继续工作，但要恢复其它模块请到角色页面「停用」后重新「激活」。");
+            }
+            return;
+        }
+
+        double sinceAwake = (DateTime.Now - loopStartedTime).TotalSeconds;
+        if (sinceAwake > 90)
+        {
+            frameworkStalled = true;
+            Console.WriteLine($"[主动事件增强][警告] 角色 [{CharacterName}] 已唤醒 {sinceAwake:0} 秒仍未收到框架启动回调（OnStart），"
+                + "框架更新循环可能已停止（常见于框架循环挂掉后才重载插件的场景）。"
+                + "本插件（报点、定时任务、挂件）仍会继续工作；如需恢复其它模块请「停用」后重新「激活」该角色。");
+        }
     }
 
     protected override async Task OnDestroy()
@@ -349,6 +453,9 @@ public class SystemEventBoostService(
         ChatBot.ChatReceived -= OnChatReceived;
         ChatBot.ChatFinishedAsync -= OnChatFinishedAsync;
 
+        loopCts?.Cancel();
+        loopCts?.Dispose();
+        loopCts = null;
         CountdownOverlayManager.Unregister(this);
 
         await interactor.ChatAsync($"程序关闭中。{Configuration.DestroyPrompt}");

@@ -47,8 +47,11 @@ public readonly record struct OverlayCharSnapshot
 /// - 通过 ElectronNET 向主窗口注入 JS：Shadow DOM 隔离样式，锚定『展开思考』开关附近，
 ///   并对其它插件的固定定位挂件（当前探测 TokenStats 的 #tstats-root）做包围盒避让
 /// - 倒计时数字由 JS 用服务端时间戳本地每 200ms 平滑递减，/state 轮询 2s 一次仅用于同步状态
+/// - 存活判定不依赖 ElectronNET 的 IPC 应答（应答事件名固定、全局单 handler，多插件并发会互相顶掉应答→先调用方
+///   永久挂起：桌宠"卡在加载 live2d"与本插件"挂件消失"同一个根因），改由注入脚本带令牌回连 /ping 上报心跳
+///   （心跳里带自检串）。心跳新鲜期间完全不占用 ElectronNET 桥；只有心跳缺失才注入一次（3s 冷却 + 无应答指数退避）
 /// - 每个胶囊可按住拖到屏幕任意位置，位置随角色配置持久化（跨 Alife 重启保留），双击归位
-/// - /poke 触发活跃需要页面令牌（防外部网页滥用烧 token）；/place（挪位置）与 /vis（按角色显示/隐藏，与设置页开关同源）无危害保持开放
+/// - /poke 触发活跃需要页面令牌（防外部网页滥用烧 token）；/ping（心跳）、/place（挪位置）与 /vis（按角色显示/隐藏，与设置页开关同源）无危害保持开放
 /// </summary>
 static class CountdownOverlayManager
 {
@@ -59,33 +62,71 @@ static class CountdownOverlayManager
     static readonly object sync = new();
     static readonly Dictionary<string, SystemEventBoostService> instances = new();
 
-    // ---- 本地 HTTP 服务（127.0.0.1，GET /state、POST /poke、POST /place）----
+    // ---- 本地 HTTP 服务（127.0.0.1，GET /state、GET /ping、POST /poke、POST /place）----
     static CancellationTokenSource? serverCts;
     static TcpListener? listener;
     static int actualPort;
     static int preferredPort;                 //配置的首选端口：漂移后定期尝试回迁
-    static string authToken = "";             //每次启动服务生成，注入进页面用于 /poke 鉴权（不随 /state 下发）
+    static string authToken = "";             //每次启动服务生成：注入进页面做 /poke 鉴权，也用于校验心跳是不是本轮服务
     static DateTime lastServerAttempt = DateTime.MinValue;
     static DateTime lastReclaimAttempt = DateTime.MinValue;
+
+    // ---- 挂件心跳（注入脚本带令牌回连 /ping）----
+    // 绝不能用 ElectronNET 的 ExecuteJavaScriptAsync 应答来判断挂件存活：
+    // 它的应答事件名固定（"webContents-executeJavaScript-completed"）、全局只保留一个 handler
+    // （SocketIOConnection.Once → SocketIO.On 内部是"先 Remove 同名 key 再 Add"），且没有超时。
+    // 于是任何两个并发的 ExecuteJavaScriptAsync 会互相顶掉应答：后注册者生效，先注册者的 TCS 永远不完成 →
+    // 先调用方永久挂起。桌宠"卡在加载 live2d"与本插件"挂件消失"同一个根因（谁先谁倒霉，所以表现为随机）。
+    // 因此改为：注入脚本主动带令牌回连本地服务上报心跳，心跳新鲜=挂件确实挂在该页面上，此时完全不碰 ElectronNET 桥。
+    static DateTime lastPingTime = DateTime.MinValue;
+    static string pingToken = "";             //最近一次心跳携带的令牌（须等于当前 authToken 才算存活）
+    static string pingDiag = "";              //最近一次心跳携带的挂件自检串（胶囊数/显隐/失败次数等）
+    static bool pingVisible = true;           //最近一次心跳时页面是否可见（隐藏页面定时器会被浏览器节流，需放宽心跳容忍时间）
+    static DateTime lastInjectTime = DateTime.MinValue;   //最近一次注入尝试（注入冷却，避免连环注入白占 ElectronNET 桥）
+    static DateTime nextInjectAllowedTime = DateTime.MinValue;  //允许注入的最早时刻（服务启动/回迁后先让开别人的激活窗口）
+    static int ipcHangCount;                  //连续"注入未拿到应答"次数（指数退避：不与其它插件互抢应答）
 
     // ---- 注入状态 ----
     static BrowserWindow? mainWindow;
     static DateTime lastEnsureTime = DateTime.MinValue;
-    static readonly SemaphoreSlim ipcLock = new(1, 1);   // ElectronNET Once 应答不带窗口Id，全局串行防串线
+    static readonly SemaphoreSlim ipcLock = new(1, 1);   // ElectronNET 应答不带窗口Id，本插件内的 IPC 调用全局串行
     static string overlayState = "未启动";      //string 引用读写原子，跨线程最多读到上一拍状态，无功能影响
 
-    /// <summary>挂件运行状态（供日志）：端口 + 注入结果 + 注册角色数</summary>
+    /// <summary>IPC 调用结果：Locked=拿到串行锁；Completed=拿到应答；Hung=超时未应答（应答很可能被其它插件顶掉）</summary>
+    readonly record struct IpcCallResult<T>(bool Locked, bool Completed, bool Hung, T? Value) where T : class;
+
+    /// <summary>挂件心跳是否新鲜且来自本次服务实例（须在 sync 锁内调用）</summary>
+    static bool OverlayAliveNoLock()
+    {
+        if (serverCts == null || actualPort == 0 || authToken.Length == 0)
+            return false;
+        if (string.Equals(pingToken, authToken, StringComparison.Ordinal) == false)
+            return false;   //令牌不符=页面里还是上一轮注入的脚本（服务重启过/端口变了），视为不存活，重新注入
+        //页面隐藏时（窗口最小化/被遮挡）浏览器会把定时器节流到约 1 次/分钟，心跳自然变稀：
+        //此时放宽容忍时间，避免误判"挂件丢了"而反复重注入（白白占用 ElectronNET 桥）
+        int toleranceSeconds = pingVisible ? 6 : 180;
+        return (DateTime.Now - lastPingTime).TotalSeconds < toleranceSeconds;
+    }
+
+    /// <summary>挂件运行状态（供日志）：端口 + 心跳/注入结果 + 注册角色数</summary>
     public static string OverlayStatus
     {
         get
         {
             int count;
-            lock (sync) count = instances.Count;
+            string state;
+            lock (sync)
+            {
+                count = instances.Count;
+                state = OverlayAliveNoLock()
+                    ? $"心跳正常{(pingDiag.Length > 0 ? "·" + pingDiag : "")}"
+                    : $"注入[{overlayState}]";
+            }
             if (count == 0)
                 return "挂件未运行（无已激活角色）";
             if (serverCts == null)
                 return $"挂件服务未启动（端口 {preferredPort} 被占用，稍后自动重试）";
-            return $"挂件运行中 · 端口 {actualPort} · 注入[{overlayState}] · {count} 个角色";
+            return $"挂件运行中 · 端口 {actualPort} · {state} · {count} 个角色";
         }
     }
 
@@ -135,20 +176,11 @@ static class CountdownOverlayManager
             overlayState = "已停止";
         }
 
-        BrowserWindow? main = mainWindow;
-        if (main != null)
-        {
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await IpcAsync(() => main.WebContents.ExecuteJavaScriptAsync<string>(
-                        "(function(){try{window.__sebCdTeardown&&window.__sebCdTeardown()}catch(e){}return 'removed'})()"));
-                }
-                catch { }
-            });
-        }
-        Log("倒计时挂件：所有角色已停止，挂件与服务已拆除");
+        //这里故意不再通过 IPC 通知页面拆除挂件：
+        //1) 少一次占用共享 ElectronNET 桥的调用（与桌宠等插件的并发调用会互相顶掉应答）；
+        //2) "停用 A 立刻激活 B"时，异步发出的拆除消息可能晚于新挂件的注入到达，把刚注入的挂件删掉。
+        //页面侧自己收尾：/state 拉不到（服务已停）连续失败后先隐藏，最终自删（见注入脚本）。
+        Log("倒计时挂件：所有角色已停止，挂件与服务已停止（页面挂件将自行退出）");
     }
 
     /// <summary>
@@ -171,15 +203,9 @@ static class CountdownOverlayManager
             {
                 if (overlayState != "配置已关闭")
                 {
+                    //不发 IPC 拆除：/state 会返回空的角色列表，页面侧自己隐藏（任一角色重新开启即自动恢复）
                     overlayState = "配置已关闭";
-                    BrowserWindow? off = mainWindow;
-                    if (off != null)
-                        _ = Task.Run(async () =>
-                        {
-                            try { await IpcAsync(() => off.WebContents.ExecuteJavaScriptAsync<string>(HideJs)); }
-                            catch { }
-                        });
-                    Log("倒计时挂件：所有角色的开关均已关闭，挂件已拆除（任一角色重新开启即恢复）");
+                    Log("倒计时挂件：所有角色的开关均已关闭，页面挂件将自行隐藏（任一角色重新开启即恢复）");
                 }
                 return;
             }
@@ -204,11 +230,38 @@ static class CountdownOverlayManager
                 }
             }
 
+            //节流：正常 1.2s 检查一次；连续"注入未拿到应答"时指数退避（桥被挂起的调用占住时，密集重试只会互相抢应答）
             lock (sync)
             {
-                if (force == false && (DateTime.Now - lastEnsureTime).TotalMilliseconds < 1200)
+                int minIntervalMs = ipcHangCount > 0
+                    ? Math.Min(1200 << Math.Min(ipcHangCount, 3), 15000)
+                    : 1200;
+                if (force == false && (DateTime.Now - lastEnsureTime).TotalMilliseconds < minIntervalMs)
                     return;
                 lastEnsureTime = DateTime.Now;
+
+                //心跳新鲜（且令牌/端口与当前服务一致）= 挂件确实挂在该页面上：本轮完全不碰 ElectronNET 桥，
+                //把桥让给桌宠等其它使用方，从根上避免"并发 ExecuteJavaScriptAsync 互相顶掉应答"
+                if (OverlayAliveNoLock())
+                {
+                    overlayState = "心跳正常";
+                    return;
+                }
+
+                //注入冷却：注入后给心跳留出到达时间，避免连环注入
+                if ((DateTime.Now - lastInjectTime).TotalSeconds < 3)
+                {
+                    overlayState = "等待挂件心跳";
+                    return;
+                }
+
+                //服务刚启动/回迁时先让开别人的窗口（例如桌宠建窗 + 注入模块）再注入：
+                //并发 ExecuteJavaScriptAsync 会互相顶掉应答，晚一点能显著降低撞车概率
+                if (DateTime.Now < nextInjectAllowedTime)
+                {
+                    overlayState = "等待注入时机";
+                    return;
+                }
             }
 
             //端口回迁：曾因端口被占漂移到备用端口时，每 60s 尝试回首选端口（挂件凭端口标记自动重注入）
@@ -238,52 +291,43 @@ static class CountdownOverlayManager
             }
             BrowserWindow main = win;
 
-            string js = ProbeJs.Replace("__PORT__", actualPort.ToString());
-            Task<string?> call = IpcAsync(() => main.WebContents.ExecuteJavaScriptAsync<string>(js));
-            if (call.IsCompletedSuccessfully && call.Result == null)
+            //心跳缺失（页面刚导航/挂件被页面重建清掉/端口或令牌变了）：重新注入一次（注入脚本会先自清理残留）。
+            //注入结果只作日志参考，不做控制流依据——应答可能被其它插件的同类调用顶掉（那时本调用会永久挂起），
+            //注入是否成功一律由注入后的心跳说了算。
+            int gap = 10;
+            lock (sync)
             {
-                overlayState = "IPC忙";
-                return;
+                SystemEventBoostService? any = instances.Values.FirstOrDefault();
+                if (any != null)
+                    gap = Math.Clamp(any.Configuration.OverlayGap, 0, 200);
+                lastInjectTime = DateTime.Now;
             }
-            if (await Task.WhenAny(call, Task.Delay(2500)) != call)
-            {
-                overlayState = "超时";
-                return;
-            }
-            string result = call.Status == TaskStatus.RanToCompletion ? (call.Result ?? "").Trim().Trim('"') : "faulted";
-            if (result == "nopage")
-            {
-                overlayState = "页面未就绪";
-                return;
-            }
+            string inject = OverlayJs
+                .Replace("__PORT__", actualPort.ToString())
+                .Replace("__GAP__", gap.ToString())
+                .Replace("__TOKEN__", authToken);
 
-            if (result.StartsWith("need", StringComparison.Ordinal))
+            IpcCallResult<string> build = await IpcAsync(() => main.WebContents.ExecuteJavaScriptAsync<string>(inject));
+            string reply = (build.Value ?? "").Trim().Trim('"');
+            if (build.Locked == false)
+                overlayState = "IPC忙";
+            else if (build.Completed == false)
             {
-                //探测发现挂件缺失（或端口变了）：清理残留后完整注入
-                int gap = 10;
-                lock (sync)
-                {
-                    SystemEventBoostService? any = instances.Values.FirstOrDefault();
-                    if (any != null)
-                        gap = Math.Clamp(any.Configuration.OverlayGap, 0, 200);
-                }
-                string inject = OverlayJs
-                    .Replace("__PORT__", actualPort.ToString())
-                    .Replace("__GAP__", gap.ToString())
-                    .Replace("__TOKEN__", authToken);
-                Task<string?> build = IpcAsync(() => main.WebContents.ExecuteJavaScriptAsync<string>(inject));
-                if (build.IsCompletedSuccessfully && build.Result == null)
-                    overlayState = "IPC忙";
-                else if (await Task.WhenAny(build, Task.Delay(2500)) == build && build.Status == TaskStatus.RanToCompletion)
-                {
-                    overlayState = "injected";
-                    Log($"倒计时挂件已注入对话面板（本地服务 http://127.0.0.1:{actualPort}/state）");
-                }
-                else
-                    overlayState = "注入超时";
+                //没拿到应答（被顶掉/页面未响应）：退避重试，等心跳到自己会转正
+                int hangs = Interlocked.Increment(ref ipcHangCount);
+                overlayState = "注入未应答·将退避重试";
+                if (hangs == 1)
+                    LogWarn("倒计时挂件注入未拿到应答（ElectronNET 的 ExecuteJavaScriptAsync 应答事件全局单 handler，"
+                        + "与桌宠等插件的并发调用会互相顶掉，也可能页面正忙），已转为退避重试");
             }
+            else if (reply == "nopage")
+                overlayState = "页面未就绪";
             else
-                overlayState = result;   //ok + 挂件内部诊断（胶囊数/显隐/fetch失败/矩形/自检结果）
+            {
+                Interlocked.Exchange(ref ipcHangCount, 0);
+                overlayState = "已注入·等待心跳";
+                Log($"倒计时挂件已注入对话面板（本地服务 http://127.0.0.1:{actualPort}/state）");
+            }
         }
         catch (Exception ex)
         {
@@ -293,16 +337,41 @@ static class CountdownOverlayManager
     }
 
     /// <summary>
-    /// IPC 串行执行（ElectronNET Once 应答不带窗口Id，交错会串线）。
-    /// 锁获取 5 秒超时：上一笔调用若因页面异常永久挂起，跳过本周期而不是跟着卡死。
-    /// 返回 null 表示没抢到锁，调用方应放弃本轮操作。
+    /// IPC 串行执行（ElectronNET 应答不带窗口Id，本插件内的调用必须串行）。
+    /// 两点关键：
+    /// 1) 锁获取 5 秒超时：上一笔调用若卡住，跳过本轮而不是跟着卡死。
+    /// 2) 单次调用 2.5 秒超时后【立即归还锁】——底层 ExecuteJavaScriptAsync 一旦永久挂起
+    ///    （应答事件全局单 handler，被其它插件的并发调用顶掉就会永不返回），若继续持锁，
+    ///    之后所有注入都只能拿到"IPC忙"，挂件被拆掉后再也回不来（多桌宠场景下的实际故障）。
     /// </summary>
-    static async Task<T?> IpcAsync<T>(Func<Task<T>> call) where T : class
+    static async Task<IpcCallResult<T>> IpcAsync<T>(Func<Task<T>> call, int timeoutMs = 2500) where T : class
     {
         if (await ipcLock.WaitAsync(TimeSpan.FromSeconds(5)) == false)
-            return null;
-        try { return await call(); }
-        finally { ipcLock.Release(); }
+            return new IpcCallResult<T>(Locked: false, Completed: false, Hung: false, Value: null);
+
+        bool released = false;
+        try
+        {
+            Task<T> task = call();
+            if (await Task.WhenAny(task, Task.Delay(timeoutMs)) != task)
+            {
+                ipcLock.Release();
+                released = true;
+                return new IpcCallResult<T>(Locked: true, Completed: false, Hung: true, Value: null);
+            }
+            if (task.Status != TaskStatus.RanToCompletion)
+                return new IpcCallResult<T>(Locked: true, Completed: false, Hung: false, Value: null);
+            return new IpcCallResult<T>(Locked: true, Completed: true, Hung: false, Value: task.Result);
+        }
+        catch
+        {
+            return new IpcCallResult<T>(Locked: true, Completed: false, Hung: false, Value: null);
+        }
+        finally
+        {
+            if (released == false)
+                ipcLock.Release();
+        }
     }
 
     #region 本地 HTTP 服务
@@ -322,6 +391,8 @@ static class CountdownOverlayManager
                 listener = candidate;
                 actualPort = port;
                 authToken = Guid.NewGuid().ToString("N");
+                //服务刚起来先别急着注入：让开同一时刻可能正在建窗/注入模块的其它插件（例如桌宠）的窗口
+                nextInjectAllowedTime = DateTime.Now.AddSeconds(5);
                 serverCts = new CancellationTokenSource();
                 _ = Task.Run(() => AcceptLoopAsync(candidate, serverCts.Token));
                 return true;
@@ -348,6 +419,7 @@ static class CountdownOverlayManager
             serverCts?.Cancel();
             listener = candidate;
             actualPort = preferredPort;
+            nextInjectAllowedTime = DateTime.Now.AddSeconds(5);
             serverCts = new CancellationTokenSource();
             _ = Task.Run(() => AcceptLoopAsync(candidate, serverCts.Token));
             Log($"倒计时挂件服务已回迁首选端口 {preferredPort}（挂件将自动重连）");
@@ -409,7 +481,27 @@ static class CountdownOverlayManager
                 if (queryIndex >= 0)
                     path = path[..queryIndex];
 
-                if (path == "/state" && method == "GET")
+                if (path == "/ping" && method == "GET")
+                {
+                    //GET /ping?t=令牌&d=自检串 → 注入脚本的心跳（带令牌，无需鉴权也无危害）。
+                    //令牌与当前服务一致且时间新鲜才算"挂件挂在该页面上"；令牌不符说明页面里还是上一轮注入的脚本
+                    //（服务重启过/端口变了），判定为不存活并重新注入。
+                    string pingT = QueryValue(query, "t") ?? "";
+                    string pingV = QueryValue(query, "v") ?? "1";
+                    string pingD = QueryValue(query, "d") ?? "";
+                    lock (sync)
+                    {
+                        pingToken = pingT;
+                        pingVisible = pingV != "0";
+                        pingDiag = pingD;
+                        lastPingTime = DateTime.Now;
+                        if (string.Equals(pingT, authToken, StringComparison.Ordinal))
+                            ipcHangCount = 0;   //心跳在=桥是通的，清掉注入退避
+                    }
+                    await RespondAsync(stream, "200 OK", "application/json; charset=utf-8",
+                        Encoding.UTF8.GetBytes("{\"ok\":true}"), ct);
+                }
+                else if (path == "/state" && method == "GET")
                     await RespondAsync(stream, "200 OK", "application/json; charset=utf-8",
                         Encoding.UTF8.GetBytes(BuildStateJson()), ct);
                 else if (path == "/poke" && method == "POST")
@@ -560,23 +652,10 @@ static class CountdownOverlayManager
 
     #region 注入 JS
 
-    /// <summary>拆除挂件（配置关闭/全部注销时用，幂等）</summary>
-    const string HideJs = """
-        (function(){try{window.__sebCdTeardown&&window.__sebCdTeardown()}catch(e){}return 'hidden'})()
-        """;
-
-    /// <summary>
-    /// 轻量探测：挂件存活且端口一致 → 返回内部诊断串（胶囊数/显隐/fetch失败/矩形/自检）；否则 'need'（需要完整注入）
-    /// </summary>
-    const string ProbeJs = """
-        (function(){
-          if(!document.body)return 'nopage';
-          var ex=document.getElementById('seb-cd-root');
-          if(ex&&window.__sebCdAlive&&ex.dataset.sebp==String(__PORT__))
-            return 'ok '+(window.__sebCdDiag?window.__sebCdDiag():'nodiag');
-          return 'need';
-        })()
-        """;
+    // （已移除 ElectronNET IPC 探测与 IPC 拆除：挂件存活由注入脚本回连 /ping 心跳判定，
+    //   拆除由页面侧在长时间连不上本地服务后自行完成，本插件除了"注入一次"外不再占用 ElectronNET 桥。）
+    //   既彻底避开"并发 ExecuteJavaScriptAsync 互相顶掉应答导致永久挂起"，也把每次自愈探测的 IPC 调用降为 0。
+    //   心跳携带自检串，日志/状态里仍能看到胶囊数、显隐、fetch 失败次数、矩形等诊断信息。）
 
     // 挂件注入脚本。要点：
     // - root id=seb-cd-root、Shadow DOM 隔离、全局 __sebCdTeardown 可幂等拆除（跨激活/换端口安全）
@@ -642,10 +721,10 @@ static class CountdownOverlayManager
           '<div class="wrap"></div>';
           document.body.appendChild(root);
           var q=function(s){return sh.querySelector(s)},wrap=q('.wrap');
-          var placeTimer=null,pollTimer=null,tickTimer=null,ro=null,fail=0;
+          var placeTimer=null,pollTimer=null,tickTimer=null,pingTimer=null,ro=null,fail=0;
           var state=null,fetchedAt=0,mode='rem',openName=null,hoverPill=null,zeroed={},lastSig='';
           var freePos={},dragging=false,suppressClick=null,pendingPlace=null,testTimers=[];
-          var COLOR={period:'#ec4899',sleep:'#8b5cf6',work:'#3b82f6',game:'#f59e0b',cute:'#f472b6',dnd:'#6b7280',peak:'#9ca3af'};
+          var COLOR={period:'#ec4899',sleep:'#8b5cf6',work:'#3b82f6',game:'#f59e0b',cute:'#f472b6',dnd:'#6b7280',peak:'#9ca3af',stall:'#dc2626'};
           try{var m0=localStorage.getItem('sebCdMode');if(m0==='clk')mode='clk'}catch(e){}
           function p2(n){return String(n).padStart(2,'0')}
           function fmtRem(ms){
@@ -683,6 +762,7 @@ static class CountdownOverlayManager
           }
           function numTextOf(c){
             var t=targetOf(c);
+            if(c.code==='stall')return '停止';   //框架更新循环已停止：显示停止而不是 00:00
             if(t==null)return '等主人';
             if(mode==='clk')return fmtClk(t).slice(0,5);
             return fmtRem(t-srvNow());
@@ -965,6 +1045,15 @@ static class CountdownOverlayManager
             }
             if(dirty)place();
           }
+          //心跳：带本次注入的令牌回连本地服务，服务端据此判定"挂件确实挂在该页面上"。
+          //不再依赖 ElectronNET 的 IPC 应答（该应答事件名固定且全局只有一个 handler，
+          //多插件/多桌宠并发调用会互相顶掉、先调用方永久挂起），顺带上报自检串便于排错。
+          function ping(){
+            var d='';
+            try{if(window.__sebCdDiag)d=window.__sebCdDiag()}catch(e){}
+            var v=(document.visibilityState==='hidden')?'0':'1';   //隐藏页面定时器会被节流，服务端据此放宽心跳容忍
+            fetch('http://127.0.0.1:'+PORT+'/ping?t='+TOKEN+'&v='+v+'&d='+encodeURIComponent(d),{cache:'no-store'}).catch(function(){});
+          }
           function poll(){
             fetch('http://127.0.0.1:'+PORT+'/state',{cache:'no-store'})
               .then(function(r){return r.json()})
@@ -978,7 +1067,13 @@ static class CountdownOverlayManager
                 });
                 render();place();
               })
-              .catch(function(){if(++fail>=3)root.style.display='none'});
+              //连续失败只隐藏挂件内容：绝不能隐藏 root——place() 会因 root.style.display==='none' 永久早退、
+              //render() 也只恢复 wrap，挂件自此再也回不来（多桌宠并发/端口回迁时 fetch 短暂失败的真实故障）
+              //长时间连不上本地服务（角色全部停用/插件卸载/端口换了）则自删，避免页面里留一个死挂件占位置
+              .catch(function(){
+                if(++fail>=3)wrap.style.display='none';
+                if(fail>=15){try{window.__sebCdTeardown&&window.__sebCdTeardown()}catch(e){}}
+              });
           }
           //卡片关闭：document 级 mousemove 监测，指针离开 当前悬停胶囊+卡片 并集 30px 即收起
           //(只算当前胶囊而非全部，避免胶囊被拖散在屏幕两端时判定区域过大永不关闭)
@@ -1001,6 +1096,8 @@ static class CountdownOverlayManager
           //不要用 wrap.mouseleave+延时器：胶囊→卡片之间必然离开 wrap 盒（卡片是绝对定位），
           //稍慢的移动就会被 160ms 延时器误杀（"想点按钮卡片就消失"的根因），且关闭后 visibility:hidden 无法再悬停唤回。
           poll();place();
+          ping();
+          pingTimer=setInterval(ping,2000);
           tickTimer=setInterval(tick,200);
           pollTimer=setInterval(poll,2000);
           placeTimer=setInterval(function(){if(root.style.display!=='none')place()},1000);
@@ -1023,7 +1120,7 @@ static class CountdownOverlayManager
           };
           window.__sebCdTeardown=function(){
             window.__sebCdAlive=false;
-            clearInterval(tickTimer);clearInterval(pollTimer);clearInterval(placeTimer);
+            clearInterval(tickTimer);clearInterval(pollTimer);clearInterval(placeTimer);clearInterval(pingTimer);
             testTimers.forEach(function(t){clearTimeout(t)});
             removeEventListener('resize',place);
             document.removeEventListener('mousemove',onDocMove);
