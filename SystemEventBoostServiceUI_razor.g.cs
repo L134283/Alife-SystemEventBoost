@@ -30,6 +30,12 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
     // ========== 报点模式新增表单 ==========
     string _reportModeName = "";
     string _reportModePrompt = "";
+    // 新模式的独立活跃机制（勾选「独立计时」后生效，默认沿用全局）
+    bool _reportModeIndependent;
+    int _reportModeInterval = 90;
+    int _reportModeOffset = 30;
+    int _reportModeMultiplier = 3;
+    int _reportModeMaxRetry = 4;
 
     // ========== 实时状态刷新 ==========
     System.Timers.Timer? _refreshTimer;
@@ -105,9 +111,39 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         {
             Name = _reportModeName.Trim(),
             Prompt = _reportModePrompt,
+            IndependentActivity = _reportModeIndependent,
+            IntervalSeconds = Math.Max(10, _reportModeInterval),
+            RandomOffsetSeconds = Math.Max(0, _reportModeOffset),
+            IntervalMultiplier = Math.Max(1, _reportModeMultiplier),
+            MaxRetryCount = Math.Clamp(_reportModeMaxRetry, 0, 20),
         });
         _reportModeName = "";
         _reportModePrompt = "";
+        _reportModeIndependent = false;
+        StateHasChanged();
+    }
+
+    /// <summary>勾选「独立计时」时把全局活跃参数复制为默认值，方便在其基础上微调</summary>
+    void SyncReportModeParamsFromGlobal()
+    {
+        _reportModeInterval = Math.Max(10, Configuration.UpdateInterval);
+        _reportModeOffset = Math.Max(0, Configuration.UpdateRandomOffset);
+        _reportModeMultiplier = Math.Max(1, Configuration.UpdateIntervalMultiplier);
+        _reportModeMaxRetry = Math.Clamp(Configuration.UpdateMaxRetryCount, 0, 20);
+    }
+
+    /// <summary>某个自定义报点模式的活跃机制展示文本</summary>
+    string ReportModeActivityText(CustomReportMode mode) =>
+        mode.IndependentActivity
+            ? $"独立计时 {Math.Max(10, mode.IntervalSeconds)}s±{Math.Max(0, mode.RandomOffsetSeconds)}"
+                + $" ×{Math.Max(1, mode.IntervalMultiplier)}^{Math.Clamp(mode.MaxRetryCount, 0, 20)}"
+            : $"沿用全局 {Math.Max(10, Configuration.UpdateInterval)}s±{Math.Max(0, Configuration.UpdateRandomOffset)}"
+                + $" ×{Math.Max(1, Configuration.UpdateIntervalMultiplier)}^{Math.Clamp(Configuration.UpdateMaxRetryCount, 0, 20)}";
+
+    /// <summary>切换某个模式的独立计时开关（关闭时保留参数值，方便再次开启）</summary>
+    void ToggleReportModeIndependent(CustomReportMode mode, bool independent)
+    {
+        mode.IndependentActivity = independent;
         StateHasChanged();
     }
 
@@ -175,6 +211,64 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
     {
         Configuration.PeakHours.Remove(range);
         StateHasChanged();
+    }
+
+    // ========== 峰谷：节假日豁免 ==========
+    string _holidayStart = "";
+    string _holidayEnd = "";
+    string _holidayName = "";
+    bool _holidayFetching;
+
+    void AddHoliday()
+    {
+        if (DateTime.TryParse(_holidayStart.Trim(), out DateTime start) == false)
+            return;
+        DateTime end = DateTime.TryParse(_holidayEnd.Trim(), out DateTime parsedEnd) ? parsedEnd : start;
+        Configuration.PeakHolidays ??= [];
+        Configuration.PeakHolidays.Add(new HolidayRange
+        {
+            Start = start.Date,
+            End = end.Date,
+            Name = string.IsNullOrWhiteSpace(_holidayName) ? "自定义假期" : _holidayName.Trim(),
+            Builtin = false,
+        });
+        Configuration.PeakHolidays.Sort((x, y) => x.Start.CompareTo(y.Start));
+        _holidayStart = "";
+        _holidayEnd = "";
+        _holidayName = "";
+        StateHasChanged();
+    }
+
+    void RemoveHoliday(HolidayRange range)
+    {
+        Configuration.PeakHolidays?.Remove(range);
+        StateHasChanged();
+    }
+
+    /// <summary>恢复为插件内置节假日表（覆盖当前列表）</summary>
+    void RestoreBuiltinHolidays()
+    {
+        Configuration.PeakHolidays = HolidayPreset.CreateBuiltin();
+        StateHasChanged();
+    }
+
+    /// <summary>联网校准节假日表（失败静默，界面不做报错弹窗）</summary>
+    void FetchHolidaysOnline()
+    {
+        if (_holidayFetching)
+            return;
+        _holidayFetching = true;
+        int year = DateTime.UtcNow.AddHours(8).Year;
+        _ = Task.Run(async () =>
+        {
+            bool ok = SafeModule != null && await SafeModule.FetchHolidaysAsync(year);
+            Console.WriteLine($"[主动事件增强] 手动在线校准节假日：{(ok ? "成功" : "失败或数据为空")}");
+            await InvokeAsync(() =>
+            {
+                _holidayFetching = false;
+                StateHasChanged();
+            });
+        });
     }
 
     static int ParseDayBits(string text)
@@ -483,7 +577,8 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-desc");
-        __builder.AddContent(s++, "下次间隔 = (基础间隔 ± 随机偏移) × 间隔倍数 ^ min(连续触发次数, 最大翻倍次数)。收到主人消息后连续次数重置为 0。");
+        __builder.AddContent(s++, "下次间隔 = (基础间隔 ± 随机偏移) × 间隔倍数 ^ min(连续触发次数, 最大翻倍次数)。收到主人消息后连续次数重置为 0。"
+            + "注意：在「报点模式」中开启了「独立计时」的自定义模式会使用它自己的一组参数，不受这里影响。");
         __builder.CloseElement();
         __builder.CloseElement();
 
@@ -554,18 +649,19 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         // 当前状态
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-desc");
-        __builder.AddContent(s++, "点击下面的模式即可即时切换（保存后生效）。切换只改变报点提示词，报点间隔算法与官方完全一致。");
+        __builder.AddContent(s++, "点击模式名所在的一行即可切换（保存后生效）。每个自定义模式可单独开启「独立计时」："
+            + "开启后该模式使用自己的报点间隔，各模式之间互不影响；关闭则沿用下面的全局活跃机制。");
         __builder.CloseElement();
 
         // 模式列表
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "display:flex;flex-direction:column;gap:8px;margin-top:10px;");
         // 默认官方
-        RenderReportModeItem(__builder, ref s, "默认官方报点", Configuration.UpdatePrompt, IsReportModeActive(null), () => SwitchReportModeInUi(null), null);
+        RenderReportModeItem(__builder, ref s, null, "默认官方报点", Configuration.UpdatePrompt, IsReportModeActive(null), () => SwitchReportModeInUi(null), null);
         // 自定义模式
         foreach (CustomReportMode mode in Configuration.CustomReportModes)
         {
-            RenderReportModeItem(__builder, ref s, mode.Name, mode.Prompt, IsReportModeActive(mode.Name), () => SwitchReportModeInUi(mode.Name), () => RemoveReportModeInUi(mode));
+            RenderReportModeItem(__builder, ref s, mode, mode.Name, mode.Prompt, IsReportModeActive(mode.Name), () => SwitchReportModeInUi(mode.Name), () => RemoveReportModeInUi(mode));
         }
         __builder.CloseElement();
 
@@ -599,6 +695,43 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseComponent();
         __builder.CloseElement();
         __builder.CloseElement();
+
+        // 独立活跃机制开关（关闭＝沿用全局活跃机制）
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.AddAttribute(s++, "style", "margin-top:12px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "flex:1;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;font-size:13px;");
+        __builder.AddContent(s++, "独立计时（该模式使用自己的报点间隔）");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
+        __builder.AddContent(s++, "开启后该模式的报点时间与全局/其它模式完全独立（每个模式各自一套节奏）；关闭则沿用全局活跃机制。");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, _reportModeIndependent, v =>
+        {
+            _reportModeIndependent = v;
+            if (v)
+                SyncReportModeParamsFromGlobal();
+            StateHasChanged();
+        });
+        __builder.CloseElement();
+        if (_reportModeIndependent)
+        {
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "class", "seb-grid");
+            __builder.AddAttribute(s++, "style", "margin-top:12px;");
+            RenderNumberField(__builder, ref s, "独立基础间隔 (秒)", _reportModeInterval, 10, 86400, v => _reportModeInterval = v, () => _reportModeInterval);
+            RenderNumberField(__builder, ref s, "独立随机偏移 (秒)", _reportModeOffset, 0, 3600, v => _reportModeOffset = v, () => _reportModeOffset);
+            RenderNumberField(__builder, ref s, "独立间隔倍数", _reportModeMultiplier, 1, 10, v => _reportModeMultiplier = v, () => _reportModeMultiplier);
+            RenderNumberField(__builder, ref s, "独立最大翻倍次数", _reportModeMaxRetry, 0, 20, v => _reportModeMaxRetry = v, () => _reportModeMaxRetry);
+            __builder.CloseElement();
+        }
+
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "margin-top:12px;");
         __builder.OpenComponent<Button>(s++);
@@ -1109,6 +1242,160 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         }));
         __builder.CloseComponent();
         __builder.CloseElement();
+
+        // ---- 节假日豁免（DeepSeek 法定节假日按谷价计费，峰谷不生效） ----
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "margin-top:14px;border-top:1px dashed #f0d7e6;padding-top:12px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "flex:1;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;");
+        __builder.AddContent(s++, "节假日豁免峰谷");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
+        __builder.AddContent(s++, "命中节假日列表的当天全天视为谷价，不停止自主活跃（假期 DeepSeek 按谷时计费）；"
+            + "调休补班的周末不做特殊处理，仍按上面的「生效星期」判断。");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, Configuration.PeakHolidayExempt, v => Configuration.PeakHolidayExempt = v);
+        __builder.CloseElement();
+
+        // 今日状态
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "margin-top:8px;font-size:12px;color:#9d4b74;");
+        __builder.AddContent(s++, SafeModule?.IsPeakExemptByHoliday == true
+            ? $"今日：{SafeModule.TodayHolidayName} · 峰谷已豁免（谷价，可自主活跃）"
+            : SafeModule?.TodayHolidayName != null
+                ? $"今日：{SafeModule.TodayHolidayName}（节假日豁免开关已关闭）"
+                : "今日：非节假日，峰谷按上面的时段正常运行");
+        __builder.CloseElement();
+
+        // 节假日列表
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "margin-top:10px;");
+        __builder.OpenElement(s++, "span");
+        __builder.AddAttribute(s++, "class", "seb-label");
+        __builder.AddContent(s++, "节假日列表");
+        __builder.CloseElement();
+        List<HolidayRange> holidays = Configuration.PeakHolidays ?? [];
+        if (holidays.Count == 0)
+        {
+            __builder.OpenComponent<Empty>(s++);
+            __builder.AddComponentParameter(s++, "Description", RuntimeHelpers.TypeCheck((OneOf<string, bool?>)"没有节假日，峰谷在所有开启的星期按上面的时段运行"));
+            __builder.CloseComponent();
+        }
+        else
+        {
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "style", "display:flex;flex-direction:column;gap:6px;");
+            foreach (HolidayRange holiday in holidays.ToList())
+            {
+                __builder.OpenElement(s++, "div");
+                __builder.AddAttribute(s++, "style", "display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;background:#fff5fa;border:1px solid #ffe3f0;border-radius:10px;");
+                __builder.OpenElement(s++, "span");
+                __builder.AddAttribute(s++, "style", "font-size:12px;color:#7c2d5a;");
+                __builder.AddContent(s++, holiday.Display);
+                __builder.CloseElement();
+                __builder.OpenComponent<Button>(s++);
+                __builder.AddComponentParameter(s++, "Size", RuntimeHelpers.TypeCheck(ButtonSize.Small));
+                __builder.AddComponentParameter(s++, "Type", RuntimeHelpers.TypeCheck((ButtonType?)ButtonType.Text));
+                __builder.AddComponentParameter(s++, "Danger", true);
+                __builder.AddComponentParameter(s++, "OnClick", EventCallback.Factory.Create<Microsoft.AspNetCore.Components.Web.MouseEventArgs>(this, () => RemoveHoliday(holiday)));
+                __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
+                {
+                    b.AddContent(0, "移除");
+                }));
+                __builder.CloseComponent();
+                __builder.CloseElement();
+            }
+            __builder.CloseElement();
+        }
+        __builder.CloseElement();
+
+        // 添加节假日（起始 / 结束 / 名称）
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.AddAttribute(s++, "style", "margin-top:10px;");
+        __builder.OpenComponent<Input<string>>(s++);
+        __builder.AddComponentParameter(s++, "Placeholder", "起始 2026-10-01");
+        __builder.AddComponentParameter(s++, "Value", _holidayStart);
+        __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => _holidayStart = v));
+        __builder.AddComponentParameter(s++, "Style", "width:160px;");
+        __builder.CloseComponent();
+        __builder.OpenComponent<Input<string>>(s++);
+        __builder.AddComponentParameter(s++, "Placeholder", "结束（留空=同一天）");
+        __builder.AddComponentParameter(s++, "Value", _holidayEnd);
+        __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => _holidayEnd = v));
+        __builder.AddComponentParameter(s++, "Style", "width:170px;");
+        __builder.CloseComponent();
+        __builder.OpenComponent<Input<string>>(s++);
+        __builder.AddComponentParameter(s++, "Placeholder", "名称，如 国庆节");
+        __builder.AddComponentParameter(s++, "Value", _holidayName);
+        __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => _holidayName = v));
+        __builder.AddComponentParameter(s++, "Style", "flex:1;min-width:120px;");
+        __builder.CloseComponent();
+        __builder.OpenComponent<Button>(s++);
+        __builder.AddComponentParameter(s++, "Size", RuntimeHelpers.TypeCheck(ButtonSize.Small));
+        __builder.AddComponentParameter(s++, "Type", RuntimeHelpers.TypeCheck((ButtonType?)ButtonType.Primary));
+        __builder.AddComponentParameter(s++, "OnClick", EventCallback.Factory.Create<Microsoft.AspNetCore.Components.Web.MouseEventArgs>(this, () => AddHoliday()));
+        __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
+        {
+            b.AddContent(0, "添加");
+        }));
+        __builder.CloseComponent();
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:6px 0 0 0;");
+        __builder.AddContent(s++, "日期格式 yyyy-MM-dd（本地日期）；「内置」条目来自插件内置表（当前为 2026 年官方放假安排），可删除或一键恢复。");
+        __builder.CloseElement();
+
+        // 恢复内置表 / 在线校准
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.AddAttribute(s++, "style", "margin-top:10px;");
+        __builder.OpenComponent<Button>(s++);
+        __builder.AddComponentParameter(s++, "Size", RuntimeHelpers.TypeCheck(ButtonSize.Small));
+        __builder.AddComponentParameter(s++, "OnClick", EventCallback.Factory.Create<Microsoft.AspNetCore.Components.Web.MouseEventArgs>(this, () => RestoreBuiltinHolidays()));
+        __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
+        {
+            b.AddContent(0, "恢复内置节假日表");
+        }));
+        __builder.CloseComponent();
+        __builder.OpenComponent<Button>(s++);
+        __builder.AddComponentParameter(s++, "Size", RuntimeHelpers.TypeCheck(ButtonSize.Small));
+        __builder.AddComponentParameter(s++, "Loading", _holidayFetching);
+        __builder.AddComponentParameter(s++, "OnClick", EventCallback.Factory.Create<Microsoft.AspNetCore.Components.Web.MouseEventArgs>(this, () => FetchHolidaysOnline()));
+        __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
+        {
+            b.AddContent(0, "在线校准（需联网）");
+        }));
+        __builder.CloseComponent();
+        __builder.CloseElement();
+
+        // 每年自动在线校准
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.AddAttribute(s++, "style", "margin-top:10px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "flex:1;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;font-size:13px;");
+        __builder.AddContent(s++, "每年首次启动自动在线校准节假日");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
+        __builder.AddContent(s++, "开启后每个自然年联网拉取一次当年节假日（用于自动跟进官方放假安排）；请求失败会被忽略，继续使用本地表。默认关闭。");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, Configuration.PeakHolidayAutoFetch, v => Configuration.PeakHolidayAutoFetch = v);
+        __builder.CloseElement();
+        __builder.CloseElement();
         __builder.CloseElement();
 
         __builder.CloseElement();
@@ -1178,6 +1465,22 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         RenderSwitch(__builder, ref s, Configuration.WorkSuppressCompanionModes, v => Configuration.WorkSuppressCompanionModes = v);
         __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.AddAttribute(s++, "style", "margin-top:10px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "flex:1;");
+        __builder.AddContent(s++, "结束时清理本次会话创建的未触发临时任务");
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, Configuration.CleanWorkSessionTasksOnExit, v => Configuration.CleanWorkSessionTasksOnExit = v);
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:6px 0 0 0;");
+        __builder.AddContent(s++, "默认关闭。开启后，工作模式结束/中止时会删掉这次干活期间创建、还没到点的临时任务，避免残留；"
+            + "若你的临时任务本来就安排在工作结束之后触发（如「1 小时后提醒我」），开启会被一起清掉，请按需取舍。"
+            + "（已触发的临时任务无论开关如何都会自动删除）");
+        __builder.CloseElement();
         __builder.CloseElement();
 
         // 可用工具
@@ -1219,17 +1522,24 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
 
     // ========== 通用渲染辅助 ==========
 
-    /// <summary>报点模式列表项：点击切换，激活高亮，可带删除按钮</summary>
-    void RenderReportModeItem(RenderTreeBuilder b, ref int s, string name, string prompt, bool active,
+    /// <summary>
+    /// 报点模式列表项：点击名称行切换模式（激活高亮），自定义模式附带「独立计时」开关 + 独立节奏参数 + 删除按钮。
+    /// 开关与数字输入放在名称行之外，避免点击它们误触发模式切换。
+    /// </summary>
+    void RenderReportModeItem(RenderTreeBuilder b, ref int s, CustomReportMode? mode, string name, string prompt, bool active,
         Action onClick, Action? onRemove)
     {
         b.OpenElement(s++, "div");
         b.AddAttribute(s++, "style",
-            "display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:12px;cursor:pointer;border:1px solid " +
+            "padding:10px 14px;border-radius:12px;border:1px solid " +
             (active ? "#ec4899" : "#ffe3f0") + ";background:" + (active ? "#fdeef6" : "#fff5fa") + ";");
-        b.AddAttribute(s++, "onclick", onClick);
+
+        // 名称行（可点击切换）+ 删除按钮
         b.OpenElement(s++, "div");
-        b.AddAttribute(s++, "style", "flex:1;min-width:0;");
+        b.AddAttribute(s++, "style", "display:flex;align-items:center;gap:10px;");
+        b.OpenElement(s++, "div");
+        b.AddAttribute(s++, "style", "flex:1;min-width:0;cursor:pointer;");
+        b.AddAttribute(s++, "onclick", onClick);
         b.OpenElement(s++, "div");
         b.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;display:flex;align-items:center;gap:8px;");
         b.AddContent(s++, name);
@@ -1271,6 +1581,37 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             }));
             b.CloseComponent();
         }
+        b.CloseElement();
+
+        // 独立活跃机制（仅自定义模式）
+        if (mode != null)
+        {
+            b.OpenElement(s++, "div");
+            b.AddAttribute(s++, "style", "display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;border-top:1px dashed #f0d7e6;padding-top:8px;");
+            b.OpenElement(s++, "div");
+            b.AddAttribute(s++, "style", "font-size:12px;color:" + (mode.IndependentActivity ? "#ec4899" : "#9d4b74") + ";");
+            b.AddContent(s++, $"独立计时：{ReportModeActivityText(mode)}");
+            b.CloseElement();
+            RenderSwitch(b, ref s, mode.IndependentActivity, v => ToggleReportModeIndependent(mode, v));
+            b.CloseElement();
+
+            if (mode.IndependentActivity)
+            {
+                b.OpenElement(s++, "div");
+                b.AddAttribute(s++, "class", "seb-grid");
+                b.AddAttribute(s++, "style", "margin-top:10px;");
+                RenderNumberField(b, ref s, "基础间隔 (秒)", mode.IntervalSeconds, 10, 86400,
+                    v => { mode.IntervalSeconds = v; StateHasChanged(); }, () => mode.IntervalSeconds);
+                RenderNumberField(b, ref s, "随机偏移 (秒)", mode.RandomOffsetSeconds, 0, 3600,
+                    v => { mode.RandomOffsetSeconds = v; StateHasChanged(); }, () => mode.RandomOffsetSeconds);
+                RenderNumberField(b, ref s, "间隔倍数", mode.IntervalMultiplier, 1, 10,
+                    v => { mode.IntervalMultiplier = v; StateHasChanged(); }, () => mode.IntervalMultiplier);
+                RenderNumberField(b, ref s, "最大翻倍次数", mode.MaxRetryCount, 0, 20,
+                    v => { mode.MaxRetryCount = v; StateHasChanged(); }, () => mode.MaxRetryCount);
+                b.CloseElement();
+            }
+        }
+
         b.CloseElement();
     }
 

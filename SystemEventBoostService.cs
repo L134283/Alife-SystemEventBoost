@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.Linq;
+using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
@@ -48,7 +51,13 @@ public class SystemEventBoostService(
             // OnStart 不会重跑,nextActivityTime 等调度状态仍停留在旧配置计算的时刻:
             // 挂件倒计时与实际间隔不符,且要等旧报点时刻到达才恢复(期间反复改配置也一直不对)。
             // 这里检测调度相关配置的变化,立即按新配置重新对齐下次活跃时间。
-            if (old != null && old != value && IsStarted && SchedulingConfigChanged(old, value))
+            //
+            // 注意不要加 IsStarted 守卫:角色激活时模块先以默认配置跑完 OnAwake/OnStart(并可能已排出
+            // 第一个周期的时刻),框架随后才把磁盘里的真实配置热应用进来,而此刻 IsStarted 往往还没置位。
+            // 若跳过重排,激活后的第一个周期就会沿用"默认配置算出的间隔/峰谷抑制状态"(要等下一个 tick
+            // 才纠正,表现为刚激活时挂件间隔与配置不符)。ResetScheduling 只改时刻、无副作用,提前执行安全。
+            // (若框架是「就地更新配置字段」而非替换对象,setter 不会被调用,由 TickActivity 的配置指纹校验兜底)
+            if (old != null && old != value && SchedulingConfigChanged(old, value))
             {
                 try
                 {
@@ -75,6 +84,7 @@ public class SystemEventBoostService(
     bool groupSilenceFlag;            // 本次Chat是否被睡眠静默占位改写（防误判唤醒）
     bool wasSleeping;                 // 上一次检测的睡眠状态（用于睡眠结束时的唤醒提示）
     DateTime lastUserInteractionTime; // 最近真实互动时间（撒娇智能节流）
+    string? scheduleFingerprint;      // 当前排期所用的「调度相关配置」指纹（见 BuildScheduleFingerprint）
 
     // ===== 自有周期循环 + 框架循环看门狗 =====
     // 框架的 ChatActivity.StartTimer 是"边遍历 container.Instances 边 await 各模块 UpdateAsync"，
@@ -97,6 +107,7 @@ public class SystemEventBoostService(
     DateTime workPhaseStartTime;      // 当前阶段开始时间（用于超时判断）
     DateTime workStepStartTime;       // 当前步骤开始时间（用于单步超时判断）
     StringBuilder workPlanBuffer = new(); // 收集 AI 输出的计划文本
+    readonly HashSet<Guid> workSessionTaskIds = []; // 本次工作会话期间创建的一次性任务（可选在结束时清理）
 
     bool IsSleeping => sleepWaitForUser || (sleepUntil != null && sleepUntil > DateTime.Now);
     bool IsGameModeActive => Configuration.MasterGameMode && Configuration.GameModeEnabled;
@@ -155,8 +166,14 @@ public class SystemEventBoostService(
             return ("work", $"工作模式·{workPhase}");
         if (IsSleeping)
             return ("sleep", sleepWaitForUser ? "睡眠中·等待主人消息" : "睡眠中·倒计时中");
-        if (Configuration.MasterPeakMode && Configuration.PeakModeEnabled && IsPeakHour(DateTime.Now))
-            return ("peak", "高峰时段·自主活跃已暂停");
+        if (Configuration.MasterPeakMode && Configuration.PeakModeEnabled)
+        {
+            if (IsPeakHour(DateTime.Now))
+                return ("peak", "高峰时段·自主活跃已暂停");
+            //节假日豁免：峰谷不生效（谷价），状态按正常周期报点展示，仅文案提示
+            if (Configuration.PeakHolidayExempt && TodayHolidayName is string holiday)
+                return ("period", $"节假日（{holiday}）·峰谷已豁免");
+        }
         if (IsGameModeActive)
             return ("game", "游戏陪伴");
         if (IsCuteModeActive && !IsDndActive)
@@ -283,7 +300,7 @@ public class SystemEventBoostService(
         //详细规则：只放「函数文档里没有的全局行为规则」，按总开关过滤，避免与函数 Description 重复
         StringBuilder detail = new();
         if (Configuration.MasterScheduledTask)
-            detail.AppendLine("- 定时任务：循环任务按「每天/每周几 + 时分」触发；临时任务按「N分钟后」触发一次后自动失效");
+            detail.AppendLine("- 定时任务：循环任务按「每天/每周几 + 时分」触发；临时任务按「N分钟后」触发一次，触发后由系统自动删除，不需要你手动清理");
         if (Configuration.MasterWorkMode || Configuration.MasterSleepMode || Configuration.MasterDndMode || Configuration.MasterPeakMode || Configuration.MasterGameMode || Configuration.MasterCuteMode)
             detail.AppendLine("- 模式优先级：工作模式 > 睡眠 > 勿扰 > 峰谷 > 游戏陪伴 > 撒娇；工作/睡眠期间不进行其他主动报点");
         if (Configuration.MasterSleepMode)
@@ -291,7 +308,10 @@ public class SystemEventBoostService(
         if (Configuration.MasterDndMode)
             detail.AppendLine("- 勿扰：自主活动但禁止 speak/qchat 等打扰标签，可按「允许做的事」清单自娱自乐");
         if (Configuration.MasterPeakMode)
-            detail.AppendLine("- 峰谷：高峰时段（默认北京时间 9-12/14-18、周一至周五）自动暂停自主活跃，空闲时段恢复");
+            detail.AppendLine("- 峰谷：高峰时段（默认北京时间 9-12/14-18、周一至周五）自动暂停自主活跃，空闲时段恢复；"
+                + "法定节假日（如国庆/春节假期）全天豁免、不抑制自主活跃（此时按谷价计费更划算）");
+        if (Configuration.MasterReportMode)
+            detail.AppendLine("- 报点模式：可创建多个自定义报点模式；每个模式可单独开启「独立活跃机制」使用自己的报点间隔，切换模式即切换报点节奏与提示词");
         if (Configuration.MasterCuteMode)
             detail.AppendLine("- 撒娇：长时间无互动会自动拉长活跃间隔，避免频繁空转烧 token");
         if (Configuration.MasterWorkMode)
@@ -350,6 +370,9 @@ public class SystemEventBoostService(
         }
 
         //对话面板倒计时挂件已在 OnAwake 注册（不依赖框架更新循环）
+
+        //节假日表在线校准（可选开关，默认关闭；失败静默忽略，不影响离线使用）
+        TryAutoFetchHolidays();
 
         return Task.CompletedTask;
     }
@@ -578,6 +601,7 @@ public class SystemEventBoostService(
         workSteps.Clear();
         workCurrentIndex = -1;
         workPlanBuffer.Clear();
+        workSessionTaskIds.Clear();
         workPhase = WorkPhase.Planning;
         workPhaseStartTime = DateTime.Now;
         nextActivityTime = DateTime.Now.AddSeconds(10);
@@ -737,10 +761,34 @@ public class SystemEventBoostService(
         workCurrentIndex = -1;
         nextActivityTime = DateTime.Now.AddSeconds(5);
 
-        Console.WriteLine($"[工作模式] 结束，完成 {done} 步，跳过 {skipped} 步");
+        //可选兜底：清理本次工作会话期间创建、且尚未触发的一次性任务（避免残留僵尸任务）
+        int cleaned = CleanWorkSessionTasks();
+
+        Console.WriteLine($"[工作模式] 结束，完成 {done} 步，跳过 {skipped} 步，清理会话临时任务 {cleaned} 条");
 
         if (autoReport)
-            interactor.Poke($"(工作模式结束：任务「{finishedTask}」已完成 {done}/{total} 步。请向主人简要汇报成果与遗留事项)");
+            interactor.Poke($"(工作模式结束：任务「{finishedTask}」已完成 {done}/{total} 步"
+                + $"{(cleaned > 0 ? $"，并清理了 {cleaned} 条本次会话创建的未触发临时任务" : "")}。请向主人简要汇报成果与遗留事项)");
+    }
+
+    /// <summary>
+    /// 结束工作会话时清理会话内创建的一次性任务（需开启「结束时清理会话临时任务」开关），返回清理条数。
+    /// 无论开关是否开启都会清空会话记录，避免影响下一次工作会话。
+    /// </summary>
+    int CleanWorkSessionTasks()
+    {
+        if (workSessionTaskIds.Count == 0)
+            return 0;
+
+        int removed = 0;
+        if (Configuration.CleanWorkSessionTasksOnExit)
+        {
+            removed = Configuration.ScheduledTasks.RemoveAll(t => workSessionTaskIds.Contains(t.Id));
+            if (removed > 0)
+                SaveConfig();
+        }
+        workSessionTaskIds.Clear();
+        return removed;
     }
 
     #endregion
@@ -765,6 +813,7 @@ public class SystemEventBoostService(
             return; //定时任务总开关关闭，不触发任何任务
 
         bool dirty = false;
+        List<ScheduledTask>? firedOneTime = null; //一次性任务触发后直接从列表移除（不再留禁用僵尸条目）
         foreach (ScheduledTask task in Configuration.ScheduledTasks)
         {
             if (task.Enabled == false)
@@ -797,16 +846,28 @@ public class SystemEventBoostService(
             }
             else if (task.TriggerTimeUtc != null && DateTime.UtcNow >= task.TriggerTimeUtc.Value)
             {
-                task.Enabled = false; //一次性任务触发后自动禁用
+                (firedOneTime ??= []).Add(task); //先收集，循环结束后统一移除（遍历中不能改动集合）
                 due = true;
                 dirty = true;
             }
 
             if (due)
-                interactor.Poke($"[定时任务:{task.Name}] {task.Message}");
+                interactor.Poke(task.Type == ScheduledTaskType.OneTime
+                    ? $"[定时任务:{task.Name}] {task.Message}\n(该临时任务已触发完成，已自动从任务列表移除，无需再手动删除)"
+                    : $"[定时任务:{task.Name}] {task.Message}");
         }
 
-        //触发状态落盘：防重标记与一次性任务禁用跨重启生效
+        //一次性任务：触发即删除（含工作会话记录），避免列表里堆积永远看不到、也删不掉的僵尸条目
+        if (firedOneTime != null)
+        {
+            foreach (ScheduledTask fired in firedOneTime)
+            {
+                Configuration.ScheduledTasks.Remove(fired);
+                workSessionTaskIds.Remove(fired.Id);
+            }
+        }
+
+        //触发状态落盘：循环任务的防重标记与一次性任务的删除跨重启生效
         if (dirty)
             SaveConfig();
     }
@@ -817,6 +878,12 @@ public class SystemEventBoostService(
 
     void TickActivity()
     {
+        //配置指纹校验：框架既可能整体替换 Configuration 对象（走 setter 热应用），
+        //也可能「就地更新配置对象的字段」（不走 setter）——后者会让已排定的下次活跃时刻停留在旧参数上，
+        //典型表现是角色刚激活时第一个周期仍按默认配置的间隔/峰谷抑制状态走。每个 tick 比对指纹即可立即纠正。
+        if (scheduleFingerprint != BuildScheduleFingerprint())
+            ResetScheduling();
+
         //工作模式：最高优先级，专注任务执行，不进行其他主动报点（由 TickWorkMode 推进步骤）
         if (IsWorkModeActive)
         {
@@ -889,14 +956,14 @@ public class SystemEventBoostService(
             return (TimeSpan.FromSeconds(gameInterval), gameText);
         }
 
-        // ---- 周期报点（继承官方算法） ----
-        int interval = GetNextInterval(continuousTimerCount,
-            Random.Shared.Next(-Configuration.UpdateRandomOffset, Configuration.UpdateRandomOffset));
+        // ---- 周期报点（继承官方算法；独立活跃机制的自定义模式使用自己的一组参数） ----
+        (int actInterval, int actOffset, _, int actMaxRetry) = GetActivityParams();
+        int interval = GetNextInterval(continuousTimerCount, Random.Shared.Next(-actOffset, actOffset));
 
         StringBuilder sb = new();
         sb.Append("系统周期报点。");
         sb.AppendLine(GetActiveReportPrompt());
-        if (continuousTimerCount >= Configuration.UpdateMaxRetryCount)
+        if (continuousTimerCount >= actMaxRetry)
             sb.Append($"(系统周期报点已达最大间隔时间，如果你想重新活跃一段时间，请使用<{nameof(Awake)}>来重置周期报点)");
 
         // ---- 撒娇模式：压缩间隔 + 促粘人（勿扰开启时被覆盖） ----
@@ -914,7 +981,7 @@ public class SystemEventBoostService(
         // ---- 勿扰模式：自主活动但不打扰主人 ----
         if (IsDndActive)
         {
-            interval = Math.Max(interval, Configuration.UpdateInterval); //勿扰下保持克制间隔
+            interval = Math.Max(interval, actInterval); //勿扰下保持克制间隔
             sb.AppendLine(GetDndText());
         }
 
@@ -924,43 +991,97 @@ public class SystemEventBoostService(
     /// <summary>
     /// 当前生效的周期报点提示词：优先使用激活的自定义报点模式，否则回退官方默认 UpdatePrompt。
     /// </summary>
-    string GetActiveReportPrompt()
+    string? GetActiveReportPrompt()
     {
-        if (string.IsNullOrWhiteSpace(Configuration.ActiveReportModeName))
-            return Configuration.UpdatePrompt;
+        string? prompt = GetActiveReportMode()?.Prompt;
+        return string.IsNullOrWhiteSpace(prompt) ? Configuration.UpdatePrompt : prompt;
+    }
 
-        CustomReportMode? mode = Configuration.CustomReportModes.FirstOrDefault(
-            m => m.Enabled && string.Equals(m.Name, Configuration.ActiveReportModeName, StringComparison.OrdinalIgnoreCase));
-        if (mode == null || string.IsNullOrWhiteSpace(mode.Prompt))
-            return Configuration.UpdatePrompt;
-        return mode.Prompt;
+    /// <summary>当前激活的自定义报点模式（未激活/已停用/不存在时为 null）</summary>
+    CustomReportMode? GetActiveReportMode() =>
+        string.IsNullOrWhiteSpace(Configuration.ActiveReportModeName)
+            ? null
+            : Configuration.CustomReportModes.FirstOrDefault(
+                m => m.Enabled && string.Equals(m.Name, Configuration.ActiveReportModeName, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// 当前生效的活跃机制参数：激活的自定义报点模式若开启「独立活跃机制」则用该模式自己的一组参数，
+    /// 否则沿用全局活跃机制（间隔/随机偏移/倍数/最大翻倍次数）。
+    /// </summary>
+    (int Interval, int Offset, int Multiplier, int MaxRetry) GetActivityParams()
+    {
+        CustomReportMode? mode = GetActiveReportMode();
+        if (mode is { IndependentActivity: true })
+        {
+            return (Math.Max(10, mode.IntervalSeconds),
+                Math.Max(0, mode.RandomOffsetSeconds),
+                Math.Max(1, mode.IntervalMultiplier),
+                Math.Clamp(mode.MaxRetryCount, 0, 20));
+        }
+        return (Math.Max(10, Configuration.UpdateInterval),
+            Math.Max(0, Configuration.UpdateRandomOffset),
+            Math.Max(1, Configuration.UpdateIntervalMultiplier),
+            Math.Clamp(Configuration.UpdateMaxRetryCount, 0, 20));
+    }
+
+    /// <summary>当前生效的活跃机制描述（供 UI / AI 展示）</summary>
+    public string ActivityParamsText
+    {
+        get
+        {
+            (int interval, int offset, int multiplier, int maxRetry) = GetActivityParams();
+            CustomReportMode? mode = GetActiveReportMode();
+            string scope = mode is { IndependentActivity: true } ? $"「{mode.Name}」独立" : "全局";
+            return $"{scope} {interval}s±{offset} ×{multiplier}^{maxRetry}";
+        }
     }
 
     int GetNextInterval(int layer, int shake)
     {
-        int baseInterval = Configuration.UpdateInterval + shake;
-        int multiplier = (int)MathF.Pow(
-            Configuration.UpdateIntervalMultiplier,
-            MathF.Min(layer, Configuration.UpdateMaxRetryCount));
-        return Math.Max(1, baseInterval * multiplier);
+        (int baseInterval, _, int multiplier, int maxRetry) = GetActivityParams();
+        int pow = (int)MathF.Pow(multiplier, MathF.Min(layer, maxRetry));
+        return Math.Max(1, (baseInterval + shake) * pow);
     }
 
     void NextActivity()
     {
-        nextActivityTime = DateTime.Now.AddSeconds(GetNextInterval(continuousTimerCount,
-            Random.Shared.Next(-Configuration.UpdateRandomOffset, Configuration.UpdateRandomOffset)));
+        var (_, offset, _, _) = GetActivityParams();
+        nextActivityTime = DateTime.Now.AddSeconds(
+            GetNextInterval(continuousTimerCount, Random.Shared.Next(-offset, offset)));
         lastScheduleTime = DateTime.Now;
+    }
+
+    /// <summary>切换报点模式后重置报点节奏，并立即按新模式（可能含独立活跃机制）重排下次活跃时刻</summary>
+    void ApplyReportModeChange()
+    {
+        continuousTimerCount = 0;
+        NextActivity();
     }
 
     /// <summary>是否处于高峰时段（按北京时间 UTC+8 判断星期与小时，不依赖系统时区）</summary>
     bool IsPeakHour(DateTime now)
     {
         DateTime bj = now.ToUniversalTime().AddHours(8);
-        //星期过滤：未开启的星期任何时段都不算高峰（默认周一至周五）
+        //节假日豁免：法定节假日（如国庆/春节假期）DeepSeek 按谷价计费，全天不抑制自主活跃
+        if (Configuration.PeakHolidayExempt && GetHolidayName(bj.Date) != null)
+            return false;
+        //星期过滤：未开启的星期任何时段都不算高峰（默认周一至周五；调休补班的周末不特殊处理）
         if ((Configuration.PeakDayBits & (1 << (int)bj.DayOfWeek)) == 0)
             return false;
         return Configuration.PeakHours.Any(range => range.Contains(bj.Hour));
     }
+
+    /// <summary>北京时间对应日期命中的节假日名称（未命中为 null）</summary>
+    string? GetHolidayName(DateTime bjDate) =>
+        Configuration.PeakHolidays?.FirstOrDefault(r => r.Contains(bjDate))?.Name;
+
+    /// <summary>北京时间今天命中的节假日名称（供 UI 显示，未命中为 null）</summary>
+    public string? TodayHolidayName => GetHolidayName(DateTime.UtcNow.AddHours(8));
+
+    /// <summary>峰谷当前是否因节假日而豁免（供 UI 显示）</summary>
+    public bool IsPeakExemptByHoliday =>
+        Configuration.MasterPeakMode && Configuration.PeakModeEnabled
+        && Configuration.PeakHolidayExempt && TodayHolidayName != null;
 
     #endregion
 
@@ -1064,7 +1185,7 @@ public class SystemEventBoostService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("切换DeepSeek峰谷模式：高峰时段（默认北京时间9-12点、14-18点，周一至周五）自动停止自主活跃以节省资源。")]
+    [Description("切换DeepSeek峰谷模式：高峰时段（默认北京时间9-12点、14-18点，周一至周五；法定节假日自动豁免）自动停止自主活跃以节省资源。")]
     public void SetPeakMode(bool enabled)
     {
         Configuration.PeakModeEnabled = enabled;
@@ -1074,13 +1195,23 @@ public class SystemEventBoostService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("自主调整你的活跃间隔（周期报点的基础间隔，秒）。最短20秒。")]
+    [Description("自主调整你的活跃间隔（周期报点的基础间隔，秒），最短20秒。若当前激活的自定义报点模式开启了独立活跃机制，则调整的是该模式自己的间隔。")]
     public void SetActiveInterval([Description("间隔秒数，不得低于20")] int intervalSeconds)
     {
-        Configuration.UpdateInterval = Math.Max(20, intervalSeconds);
+        int seconds = Math.Max(20, intervalSeconds);
+        CustomReportMode? mode = GetActiveReportMode();
+        if (mode is { IndependentActivity: true })
+        {
+            mode.IntervalSeconds = seconds;
+            SaveConfig();
+            ApplyReportModeChange();
+            interactor.Poke($"(已将报点模式「{mode.Name}」的独立活跃间隔调整为 {seconds} 秒)");
+            return;
+        }
+        Configuration.UpdateInterval = seconds;
         SaveConfig();
         NextActivity();
-        interactor.Poke($"(已将活跃间隔调整为 {Configuration.UpdateInterval} 秒)");
+        interactor.Poke($"(已将活跃间隔调整为 {seconds} 秒)");
     }
 
     #endregion
@@ -1088,10 +1219,14 @@ public class SystemEventBoostService(
     #region AI函数：报点模式
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("创建自定义报点模式：用你自定义的提示词替换周期报点文本，报点间隔算法与官方完全一致。创建后可切换到该模式。")]
+    [Description("创建自定义报点模式：用你自定义的提示词替换周期报点文本；不传间隔参数时沿用全局活跃机制，传入间隔参数则该模式拥有独立的报点节奏。创建后可切换到该模式。")]
     public void CreateReportMode(
         [Description("模式名称，如「学习模式」「新闻模式」")] string name,
-        [Description("周期报点提示词，到点后引导你做什么，如「如果你手头没重要的事，就去看看新闻或学习点新东西，保持安静」")] string prompt)
+        [Description("周期报点提示词，到点后引导你做什么，如「如果你手头没重要的事，就去看看新闻或学习点新东西，保持安静」")] string prompt,
+        [Description("可选：该模式的独立报点间隔（秒，最短10秒）。传了即为该模式开启独立活跃机制；不传则沿用全局活跃机制")] int? intervalSeconds = null,
+        [Description("可选：独立活跃机制的随机偏移（秒），默认沿用全局")] int? randomOffsetSeconds = null,
+        [Description("可选：独立活跃机制的间隔倍数，默认沿用全局")] int? intervalMultiplier = null,
+        [Description("可选：独立活跃机制的最大翻倍次数，默认沿用全局")] int? maxRetryCount = null)
     {
         name = name.Trim();
         if (string.IsNullOrWhiteSpace(name))
@@ -1101,16 +1236,68 @@ public class SystemEventBoostService(
         }
         if (Configuration.CustomReportModes.Any(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)))
         {
-            interactor.Poke($"(已存在同名报点模式「{name}」，如需修改请先删除)");
+            interactor.Poke($"(已存在同名报点模式「{name}」，如需修改请先删除，或用<{nameof(SetReportModeActivity)}>调整其活跃机制)");
             return;
         }
-        Configuration.CustomReportModes.Add(new CustomReportMode { Name = name, Prompt = prompt.Trim() });
+
+        CustomReportMode mode = new() { Name = name, Prompt = prompt.Trim() };
+        bool independent = intervalSeconds is > 0
+            || randomOffsetSeconds != null || intervalMultiplier != null || maxRetryCount != null;
+        if (independent)
+        {
+            mode.IndependentActivity = true;
+            mode.IntervalSeconds = Math.Max(10, intervalSeconds ?? Configuration.UpdateInterval);
+            mode.RandomOffsetSeconds = Math.Max(0, randomOffsetSeconds ?? Configuration.UpdateRandomOffset);
+            mode.IntervalMultiplier = Math.Max(1, intervalMultiplier ?? Configuration.UpdateIntervalMultiplier);
+            mode.MaxRetryCount = Math.Clamp(maxRetryCount ?? Configuration.UpdateMaxRetryCount, 0, 20);
+        }
+
+        Configuration.CustomReportModes.Add(mode);
         SaveConfig();
-        interactor.Poke($"(已创建报点模式「{name}」，当前仍使用原报点，需要时可用<{nameof(SwitchReportMode)}>切换)");
+        interactor.Poke(independent
+            ? $"(已创建报点模式「{name}」，独立活跃机制：{mode.ActivityText}。当前仍使用原报点，需要时可用<{nameof(SwitchReportMode)}>切换)"
+            : $"(已创建报点模式「{name}」，沿用全局活跃机制。当前仍使用原报点，需要时可用<{nameof(SwitchReportMode)}>切换)");
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("切换周期报点模式：切换到指定自定义模式，或传「默认/官方」切回默认官方报点。报点逻辑（间隔算法）不变，仅提示词改变。")]
+    [Description("调整已有自定义报点模式的活跃机制（是否独立计时及其间隔参数）。每个模式的报点时间互相独立。")]
+    public void SetReportModeActivity(
+        [Description("报点模式名称")] string name,
+        [Description("是否启用独立活跃机制：true=该模式按自己的间隔独立计时；false=沿用全局活跃机制")] bool independent,
+        [Description("基础间隔（秒），最短10秒，独立时生效")] int intervalSeconds = 90,
+        [Description("随机偏移（秒）")] int randomOffsetSeconds = 30,
+        [Description("间隔倍数")] int intervalMultiplier = 3,
+        [Description("最大翻倍次数")] int maxRetryCount = 4)
+    {
+        name = name.Trim();
+        CustomReportMode? mode = Configuration.CustomReportModes.FirstOrDefault(
+            m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (mode == null)
+        {
+            interactor.Poke($"(未找到报点模式「{name}」，可先用<{nameof(CreateReportMode)}>创建)");
+            return;
+        }
+
+        mode.IndependentActivity = independent;
+        if (independent)
+        {
+            mode.IntervalSeconds = Math.Max(10, intervalSeconds);
+            mode.RandomOffsetSeconds = Math.Max(0, randomOffsetSeconds);
+            mode.IntervalMultiplier = Math.Max(1, intervalMultiplier);
+            mode.MaxRetryCount = Math.Clamp(maxRetryCount, 0, 20);
+        }
+        SaveConfig();
+        //若调整的正是当前激活的模式，立即按新节奏重排下次活跃
+        if (string.Equals(Configuration.ActiveReportModeName, mode.Name, StringComparison.OrdinalIgnoreCase))
+            ApplyReportModeChange();
+
+        interactor.Poke(independent
+            ? $"(已将报点模式「{mode.Name}」设为独立活跃机制：{mode.ActivityText})"
+            : $"(已将报点模式「{mode.Name}」改为沿用全局活跃机制)");
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("切换周期报点模式：切换到指定自定义模式，或传「默认/官方」切回默认官方报点。提示词随之改变；若目标模式开启了独立活跃机制，报点节奏也随该模式切换。")]
     public void SwitchReportMode([Description("报点模式名称；传「默认」「官方」或留空则切回默认官方报点")] string modeName = "")
     {
         modeName = modeName.Trim();
@@ -1120,8 +1307,8 @@ public class SystemEventBoostService(
         {
             Configuration.ActiveReportModeName = null;
             SaveConfig();
-            NextActivity();
-            interactor.Poke("(已切换为默认官方报点)");
+            ApplyReportModeChange();
+            interactor.Poke($"(已切换为默认官方报点，活跃机制：{ActivityParamsText})");
             return;
         }
 
@@ -1134,22 +1321,25 @@ public class SystemEventBoostService(
         }
         Configuration.ActiveReportModeName = mode.Name;
         SaveConfig();
-        NextActivity();
-        interactor.Poke($"(已切换报点模式为「{mode.Name}」：{mode.Prompt})");
+        ApplyReportModeChange();
+        interactor.Poke($"(已切换报点模式为「{mode.Name}」，活跃机制：{ActivityParamsText}：{mode.Prompt})");
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("列出所有报点模式（含默认官方与自定义），并标注当前激活的模式。")]
+    [Description("列出所有报点模式（含默认官方与自定义）、各自的活跃机制，并标注当前激活的模式。")]
     public void ListReportModes()
     {
         StringBuilder sb = new();
+        string globalText = $"全局 {Math.Max(10, Configuration.UpdateInterval)}s±{Math.Max(0, Configuration.UpdateRandomOffset)}"
+            + $" ×{Math.Max(1, Configuration.UpdateIntervalMultiplier)}^{Math.Clamp(Configuration.UpdateMaxRetryCount, 0, 20)}";
         bool activeIsDefault = string.IsNullOrWhiteSpace(Configuration.ActiveReportModeName)
             || Configuration.CustomReportModes.All(m => !string.Equals(m.Name, Configuration.ActiveReportModeName, StringComparison.OrdinalIgnoreCase));
-        sb.AppendLine(activeIsDefault ? "● 默认官方报点（当前）" : "○ 默认官方报点");
+        sb.AppendLine(activeIsDefault ? $"● 默认官方报点（当前，{globalText}）" : $"○ 默认官方报点（{globalText}）");
         foreach (CustomReportMode mode in Configuration.CustomReportModes)
         {
             bool active = string.Equals(mode.Name, Configuration.ActiveReportModeName, StringComparison.OrdinalIgnoreCase);
-            sb.AppendLine($"{(active ? "●" : "○")} {mode.Name}{(mode.Enabled ? "" : "（已停用）")}：{mode.Prompt}");
+            string activity = mode.IndependentActivity ? $"，{mode.ActivityText}" : "，沿用全局";
+            sb.AppendLine($"{(active ? "●" : "○")} {mode.Name}{activity}{(mode.Enabled ? "" : "（已停用）")}：{mode.Prompt}");
         }
         interactor.Poke(sb.ToString());
     }
@@ -1167,11 +1357,15 @@ public class SystemEventBoostService(
             return;
         }
         Configuration.CustomReportModes.Remove(mode);
-        if (string.Equals(Configuration.ActiveReportModeName, mode.Name, StringComparison.OrdinalIgnoreCase))
+        bool wasActive = string.Equals(Configuration.ActiveReportModeName, mode.Name, StringComparison.OrdinalIgnoreCase);
+        if (wasActive)
             Configuration.ActiveReportModeName = null;
         SaveConfig();
-        NextActivity();
-        interactor.Poke($"(已删除报点模式「{mode.Name}」{(Configuration.ActiveReportModeName == null && mode.Name != "默认官方报点" ? "，报点已回退默认官方" : "")})");
+        if (wasActive)
+            ApplyReportModeChange();
+        else
+            NextActivity();
+        interactor.Poke($"(已删除报点模式「{mode.Name}」{(wasActive ? "，报点已回退默认官方" : "")})");
     }
 
     #endregion
@@ -1202,21 +1396,26 @@ public class SystemEventBoostService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("创建一条临时定时任务：N分钟（或N小时后）触发一次，提醒或让AI自主做某事。")]
+    [Description("创建一条临时定时任务：N分钟（或N小时后）触发一次，提醒或让AI自主做某事；触发后任务会自动删除，无需手动清理。")]
     public void CreateOneTimeTask(
         [Description("任务名称")] string name,
         [Description("触发时要求AI做的事")] string message,
         [Description("多少分钟后触发（如30=30分钟后，120=2小时后）")] int afterMinutes)
     {
         afterMinutes = Math.Max(1, afterMinutes);
-        Configuration.ScheduledTasks.Add(new ScheduledTask {
+        ScheduledTask task = new()
+        {
             Name = name,
             Message = message,
             Type = ScheduledTaskType.OneTime,
             TriggerTimeUtc = DateTime.UtcNow.AddMinutes(afterMinutes),
-        });
+        };
+        Configuration.ScheduledTasks.Add(task);
+        //记录到当前工作会话：便于工作模式结束时（可选开关）一并清理未触发的临时任务
+        if (IsWorkModeActive)
+            workSessionTaskIds.Add(task.Id);
         SaveConfig();
-        interactor.Poke($"(已创建临时任务「{name}」：{afterMinutes} 分钟后触发。触发内容：{message})");
+        interactor.Poke($"(已创建临时任务「{name}」：{afterMinutes} 分钟后触发，触发后自动删除。触发内容：{message})");
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -1449,7 +1648,8 @@ public class SystemEventBoostService(
             "setpeakmode" => Configuration.MasterPeakMode,
             "enterworkmode" or "workstepdone" or "skipworkstep" or "listworkplan"
                 or "pauseworkmode" or "resumeworkmode" or "abortworkmode" or "setworkstep" => Configuration.MasterWorkMode,
-            "createreportmode" or "switchreportmode" or "listreportmodes" or "removereportmode" => Configuration.MasterReportMode,
+            "createreportmode" or "switchreportmode" or "listreportmodes" or "removereportmode"
+                or "setreportmodeactivity" => Configuration.MasterReportMode,
             "createscheduledtask" or "createonetimetask" or "removescheduledtask" or "listscheduledtasks" => Configuration.MasterScheduledTask,
             "setactiveinterval" => Configuration.MasterInterval,
             "awake" or "await" => Configuration.MasterAwake,
@@ -1494,6 +1694,8 @@ public class SystemEventBoostService(
     /// </summary>
     void ResetScheduling()
     {
+        //记录本次排期所依据的配置（TickActivity 每 tick 比对，发现配置被就地改动就重排）
+        scheduleFingerprint = BuildScheduleFingerprint();
         continuousTimerCount = 0;
         if (IsSleeping)
         {
@@ -1520,6 +1722,8 @@ public class SystemEventBoostService(
             || a.UpdateRandomOffset != b.UpdateRandomOffset
             || a.UpdateIntervalMultiplier != b.UpdateIntervalMultiplier
             || a.UpdateMaxRetryCount != b.UpdateMaxRetryCount
+            || !string.Equals(a.ActiveReportModeName, b.ActiveReportModeName, StringComparison.Ordinal)
+            || ReportModesChanged(a.CustomReportModes, b.CustomReportModes)
             || a.MasterGameMode != b.MasterGameMode || a.GameModeEnabled != b.GameModeEnabled
             || a.GamePokeIntervalSeconds != b.GamePokeIntervalSeconds
             || a.MasterCuteMode != b.MasterCuteMode || a.CuteModeEnabled != b.CuteModeEnabled
@@ -1528,7 +1732,77 @@ public class SystemEventBoostService(
             || a.MasterPeakMode != b.MasterPeakMode || a.PeakModeEnabled != b.PeakModeEnabled
             || a.PeakSuppressGameMode != b.PeakSuppressGameMode
             || a.PeakDayBits != b.PeakDayBits
-            || PeakHoursChanged(a.PeakHours, b.PeakHours);
+            || a.PeakHolidayExempt != b.PeakHolidayExempt
+            || PeakHoursChanged(a.PeakHours, b.PeakHours)
+            || HolidaysChanged(a.PeakHolidays, b.PeakHolidays);
+    }
+
+    /// <summary>
+    /// 当前「调度相关配置」的指纹（字符串）。凡是会改变下次活跃时刻或报点节奏的配置都纳入，
+    /// 用于检测框架「就地更新配置字段」（不重新赋值 Configuration 属性、setter 不被调用）导致的排期脱节。
+    /// </summary>
+    string BuildScheduleFingerprint()
+    {
+        (int interval, int offset, int multiplier, int maxRetry) = GetActivityParams();
+        CustomReportMode? mode = GetActiveReportMode();
+        StringBuilder sb = new();
+        sb.Append(interval).Append(',').Append(offset).Append(',').Append(multiplier).Append(',').Append(maxRetry).Append(';')
+          .Append(GetActiveReportPrompt()).Append(';')
+          .Append(mode?.Name).Append(',').Append(mode?.IndependentActivity).Append(';')
+          .Append(Configuration.MasterGameMode).Append(',').Append(Configuration.GameModeEnabled).Append(',')
+          .Append(Configuration.GamePokeIntervalSeconds).Append(',')
+          .Append(Configuration.GamePrompt).Append(';')
+          .Append(Configuration.MasterCuteMode).Append(',').Append(Configuration.CuteModeEnabled).Append(',')
+          .Append(Configuration.CuteMinIntervalSeconds).Append(',').Append(Configuration.CuteIdleThrottleSeconds).Append(',')
+          .Append(Configuration.CutePrompt).Append(';')
+          .Append(Configuration.MasterDndMode).Append(',').Append(Configuration.DndModeEnabled).Append(',')
+          .Append(Configuration.DndPokeText).Append(',').Append(Configuration.DndAllowedActions).Append(';')
+          .Append(Configuration.MasterPeakMode).Append(',').Append(Configuration.PeakModeEnabled).Append(',')
+          .Append(Configuration.PeakSuppressGameMode).Append(',').Append(Configuration.PeakDayBits).Append(',')
+          .Append(Configuration.PeakHolidayExempt).Append(';');
+        foreach (TimeRange range in Configuration.PeakHours ?? [])
+            sb.Append(range.StartHour).Append('-').Append(range.EndHour).Append(',');
+        sb.Append(';');
+        foreach (HolidayRange holiday in Configuration.PeakHolidays ?? [])
+            sb.Append(holiday.Start.Ticks).Append('-').Append(holiday.End.Ticks).Append(',');
+        return sb.ToString();
+    }
+
+    /// <summary>自定义报点模式列表是否变化（含各自独立活跃机制的开关与参数）</summary>
+    static bool ReportModesChanged(List<CustomReportMode>? a, List<CustomReportMode>? b)
+    {
+        if (a == null || b == null)
+            return a != b;
+        if (a.Count != b.Count)
+            return true;
+        for (int i = 0; i < a.Count; i++)
+        {
+            CustomReportMode x = a[i];
+            CustomReportMode y = b[i];
+            if (x.Name != y.Name || x.Enabled != y.Enabled
+                || x.IndependentActivity != y.IndependentActivity
+                || x.IntervalSeconds != y.IntervalSeconds
+                || x.RandomOffsetSeconds != y.RandomOffsetSeconds
+                || x.IntervalMultiplier != y.IntervalMultiplier
+                || x.MaxRetryCount != y.MaxRetryCount)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>节假日表是否变化（影响峰谷豁免判断）</summary>
+    static bool HolidaysChanged(List<HolidayRange>? a, List<HolidayRange>? b)
+    {
+        if (a == null || b == null)
+            return a != b;
+        if (a.Count != b.Count)
+            return true;
+        for (int i = 0; i < a.Count; i++)
+        {
+            if (a[i].Start != b[i].Start || a[i].End != b[i].End)
+                return true;
+        }
+        return false;
     }
 
     static bool PeakHoursChanged(List<TimeRange>? a, List<TimeRange>? b)
@@ -1543,6 +1817,102 @@ public class SystemEventBoostService(
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// 节假日在线校准（可选，默认关闭）：
+    /// 开启后每个自然年首次启动联网拉取一次当年节假日；请求失败静默忽略，继续使用本地内置表 + 手工表。
+    /// </summary>
+    void TryAutoFetchHolidays()
+    {
+        if (Configuration.PeakHolidayAutoFetch == false)
+            return;
+        int year = DateTime.UtcNow.AddHours(8).Year;
+        if (Configuration.PeakHolidayFetchedYear >= year)
+            return;
+        _ = Task.Run(() => FetchHolidaysAsync(year));
+    }
+
+    /// <summary>
+    /// 联网获取指定年份的中国法定节假日并合并进节假日表（UI 的「在线校准」按钮也会调用）。
+    /// 合并策略：替换原本由内置表/在线来源写入的条目，保留用户手工添加的条目。返回是否成功。
+    /// </summary>
+    public async Task<bool> FetchHolidaysAsync(int year)
+    {
+        try
+        {
+            using HttpClient client = new() { Timeout = TimeSpan.FromSeconds(6) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Alife-SystemEventBoost/4.5.4");
+            string json = await client.GetStringAsync($"https://timor.tech/api/holiday/year/{year}");
+            Dictionary<string, HolidayRange> fetched = ParseHolidayJson(json);
+            if (fetched.Count == 0)
+            {
+                Console.WriteLine($"[主动事件增强] 节假日在线校准：{year} 年未获取到数据（可能官方安排尚未发布）");
+                return false;
+            }
+
+            List<HolidayRange> merged = (Configuration.PeakHolidays ?? []).Where(h => h.Builtin == false).ToList();
+            merged.AddRange(fetched.Values);
+            merged.Sort((x, y) => x.Start.CompareTo(y.Start));
+            Configuration.PeakHolidays = merged;
+            Configuration.PeakHolidayFetchedYear = year;
+            SaveConfig();
+            Console.WriteLine($"[主动事件增强] 节假日在线校准完成：{year} 年共 {fetched.Count} 段节假日");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "节假日在线校准失败（已忽略，继续使用本地节假日表）");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 解析 timor.tech 节假日接口返回的 JSON，合并为「区间」列表。
+    /// 只取 holiday=true 的放假日，调休补班日按需求直接忽略（无视调休）。
+    /// </summary>
+    static Dictionary<string, HolidayRange> ParseHolidayJson(string json)
+    {
+        Dictionary<string, HolidayRange> result = [];
+        using JsonDocument doc = JsonDocument.Parse(json);
+        if (doc.RootElement.TryGetProperty("holiday", out JsonElement holiday) == false
+            || holiday.ValueKind != JsonValueKind.Object)
+            return result;
+
+        List<(string Name, DateTime Date)> days = [];
+        foreach (JsonProperty prop in holiday.EnumerateObject())
+        {
+            JsonElement item = prop.Value;
+            if (item.ValueKind != JsonValueKind.Object)
+                continue;
+            if (item.TryGetProperty("holiday", out JsonElement holidayFlag) == false || holidayFlag.ValueKind != JsonValueKind.True)
+                continue;
+            string name = item.TryGetProperty("name", out JsonElement nameElement) ? nameElement.GetString() ?? "节假日" : "节假日";
+            string? dateText = item.TryGetProperty("date", out JsonElement dateElement) ? dateElement.GetString() : prop.Name;
+            if (dateText == null || DateTime.TryParse(dateText, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime date) == false)
+                continue;
+            days.Add((name, date.Date));
+        }
+
+        //连续（且同名）的放假日合并为一条区间，便于 UI 展示与编辑
+        foreach (IGrouping<string, (string Name, DateTime Date)> group in days.GroupBy(d => d.Name))
+        {
+            List<DateTime> sorted = group.Select(d => d.Date).OrderBy(d => d).ToList();
+            DateTime start = sorted[0];
+            DateTime prev = sorted[0];
+            for (int i = 1; i < sorted.Count; i++)
+            {
+                DateTime cur = sorted[i];
+                if ((cur - prev).TotalDays > 1)
+                {
+                    result[$"{group.Key}-{start:yyyyMMdd}"] = new HolidayRange { Start = start, End = prev, Name = group.Key, Builtin = true };
+                    start = cur;
+                }
+                prev = cur;
+            }
+            result[$"{group.Key}-{start:yyyyMMdd}"] = new HolidayRange { Start = start, End = prev, Name = group.Key, Builtin = true };
+        }
+        return result;
     }
 
     void SaveConfig()

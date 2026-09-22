@@ -70,7 +70,9 @@ public class ScheduledTask
 }
 
 /// <summary>
-/// 自定义报点模式：仅替换周期报点的提示词文本，报点间隔算法（随机偏移、翻倍等）与官方完全一致。
+/// 自定义报点模式：替换周期报点的提示词文本；可选是否使用「独立活跃机制」。
+/// 关闭独立计时时，报点间隔算法（基础间隔、随机偏移、翻倍等）与全局活跃机制完全一致；
+/// 开启后该模式使用自己的一组参数（每个模式独立计时，切换模式即切换报点节奏）。
 /// </summary>
 public class CustomReportMode
 {
@@ -85,7 +87,32 @@ public class CustomReportMode
     /// <summary>是否启用（停用后自动回退默认报点）</summary>
     public bool Enabled { get; set; } = true;
 
+    #region 独立活跃机制（IndependentActivity = true 时生效，默认沿用全局）
+
+    /// <summary>是否使用独立活跃机制：false=沿用全局活跃机制（默认），true=本模式独立计时</summary>
+    public bool IndependentActivity { get; set; }
+
+    /// <summary>独立活跃机制：基础间隔（秒），最短 10 秒</summary>
+    public int IntervalSeconds { get; set; } = 90;
+
+    /// <summary>独立活跃机制：随机偏移（秒）</summary>
+    public int RandomOffsetSeconds { get; set; } = 30;
+
+    /// <summary>独立活跃机制：间隔倍数</summary>
+    public int IntervalMultiplier { get; set; } = 3;
+
+    /// <summary>独立活跃机制：最大翻倍次数</summary>
+    public int MaxRetryCount { get; set; } = 4;
+
+    #endregion
+
     public string Display => Name;
+
+    /// <summary>展示用节奏摘要（沿用全局时由调用方拼接全局参数）</summary>
+    public string ActivityText =>
+        IndependentActivity
+            ? $"独立 {Math.Max(10, IntervalSeconds)}s±{Math.Max(0, RandomOffsetSeconds)} ×{Math.Max(1, IntervalMultiplier)}^{Math.Clamp(MaxRetryCount, 0, 20)}"
+            : "沿用全局";
 }
 
 /// <summary>高峰时段区间（按北京时间判断）</summary>
@@ -95,6 +122,58 @@ public class TimeRange
     public int EndHour { get; set; }
 
     public bool Contains(int hour) => hour >= StartHour && hour < EndHour;
+}
+
+/// <summary>
+/// 节假日区间（按北京时间日期判断，含首尾两天）。
+/// 用于峰谷节假日豁免：命中区间的当天全天视为谷价，不抑制自主活跃。
+/// </summary>
+public class HolidayRange
+{
+    /// <summary>起始日期（当天 00:00，仅日期有效）</summary>
+    public DateTime Start { get; set; }
+
+    /// <summary>结束日期（含当天）</summary>
+    public DateTime End { get; set; }
+
+    /// <summary>节假日名称，如「国庆节」</summary>
+    public string Name { get; set; } = "";
+
+    /// <summary>是否由插件内置表写入（UI 显示为「内置」，可删除或恢复）</summary>
+    public bool Builtin { get; set; }
+
+    public bool Contains(DateTime date)
+    {
+        DateTime d = date.Date;
+        DateTime start = Start.Date;
+        DateTime end = End.Date;
+        if (end < start)
+            (start, end) = (end, start);
+        return d >= start && d <= end;
+    }
+
+    public string Display =>
+        $"{(Start.Date == End.Date ? $"{Start:yyyy-MM-dd}" : $"{Start:yyyy-MM-dd} ~ {End:yyyy-MM-dd}")}　{Name}{(Builtin ? "（内置）" : "")}";
+}
+
+/// <summary>
+/// 节假日内置表（离线保底）：中国法定节假日放假区间。
+/// 农历节日每年浮动，需随官方发布更新；用户可在配置面板增删，或开启「在线校准」自动刷新。
+/// </summary>
+public static class HolidayPreset
+{
+    /// <summary>内置节假日区间（当前为 2026 年，官方发布后新版本会补充新年度）</summary>
+    public static List<HolidayRange> CreateBuiltin() =>
+    [
+        // 依据《国务院办公厅关于 2026 年部分节假日安排的通知》
+        new() { Start = new DateTime(2026, 1, 1), End = new DateTime(2026, 1, 3), Name = "元旦", Builtin = true },
+        new() { Start = new DateTime(2026, 2, 15), End = new DateTime(2026, 2, 23), Name = "春节", Builtin = true },
+        new() { Start = new DateTime(2026, 4, 4), End = new DateTime(2026, 4, 6), Name = "清明节", Builtin = true },
+        new() { Start = new DateTime(2026, 5, 1), End = new DateTime(2026, 5, 5), Name = "劳动节", Builtin = true },
+        new() { Start = new DateTime(2026, 6, 19), End = new DateTime(2026, 6, 21), Name = "端午节", Builtin = true },
+        new() { Start = new DateTime(2026, 9, 25), End = new DateTime(2026, 9, 27), Name = "中秋节", Builtin = true },
+        new() { Start = new DateTime(2026, 10, 1), End = new DateTime(2026, 10, 7), Name = "国庆节", Builtin = true },
+    ];
 }
 
 /// <summary>工作模式阶段</summary>
@@ -269,6 +348,25 @@ public class SystemEventBoostServiceConfig
     public int PeakDayBits { get; set; } = (1 << (int)DayOfWeek.Monday) | (1 << (int)DayOfWeek.Tuesday)
         | (1 << (int)DayOfWeek.Wednesday) | (1 << (int)DayOfWeek.Thursday) | (1 << (int)DayOfWeek.Friday);
 
+    /// <summary>
+    /// 节假日豁免（默认开启）：命中节假日列表的当天全天视为谷价，峰谷不生效（不抑制自主活跃）。
+    /// DeepSeek 计费在法定节假日按谷时价格，假期里主动活跃更划算；调休补班的周末不特殊处理，
+    /// 仍按上面的「生效星期」判断（即无视调休，周末照旧不参与峰谷）。
+    /// </summary>
+    public bool PeakHolidayExempt { get; set; } = true;
+
+    /// <summary>节假日区间列表（默认写入内置表；可在配置面板增删）</summary>
+    public List<HolidayRange> PeakHolidays { get; set; } = HolidayPreset.CreateBuiltin();
+
+    /// <summary>
+    /// 在线校准节假日表（默认关闭）：开启后每个自然年首次启动会联网获取当年节假日并写入列表
+    /// （仅补内置/在线来源的日期，用户手工添加的条目保留；请求失败静默忽略，不影响离线使用）。
+    /// </summary>
+    public bool PeakHolidayAutoFetch { get; set; }
+
+    /// <summary>上次在线校准的年份（内部状态，避免一年内重复请求）</summary>
+    public int PeakHolidayFetchedYear { get; set; }
+
     #endregion
 
     #region 勿扰模式
@@ -320,6 +418,13 @@ public class SystemEventBoostServiceConfig
     /// <summary>工作模式下注入的可用工具触发标签（逗号分隔，告诉 AI 干活有哪些工具）</summary>
     public string WorkInjectedTools { get; set; } =
         "<python/>写代码跑脚本、<process/>执行进程、<file/>读写文件、<browser/>操作浏览器、<smartwebsearch/>上网搜索、<skill/>加载技能、<AlifeMcp/>平台控制";
+
+    /// <summary>
+    /// 工作模式结束/中止时，清理「本次工作会话期间创建、且尚未触发」的临时任务（默认关闭）。
+    /// 开启可避免干活期间创建的临时任务残留成僵尸任务；但若你的临时任务本来就安排在
+    /// 工作结束之后触发（如「1 小时后提醒我」），开启会被一起清掉，请按需取舍。
+    /// </summary>
+    public bool CleanWorkSessionTasksOnExit { get; set; }
 
     #endregion
 
