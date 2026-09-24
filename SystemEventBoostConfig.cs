@@ -428,25 +428,37 @@ public class SystemEventBoostServiceConfig
 
     #endregion
 
-    #region 倒计时挂件（对话面板）
+    #region 倒计时挂件（全局窗口）
 
     /// <summary>
-    /// 在对话面板显示距下次自主活跃的倒计时挂件：
+    /// 在对话窗口显示距下次自主活跃的倒计时挂件（框架 globalUI 全局渲染）：
     /// 每个已激活角色一枚胶囊（状态色 + 倒计时），悬停展开详情卡（下次活跃时刻/间隔进度/睡眠/工作），
-    /// 卡内可"催一下"立即触发活跃；多角色共享一个挂件自动堆叠，并与其它插件的挂件避让。
+    /// 卡内可"催一下"立即触发活跃；多角色共享一个挂件自动堆叠，并可自动避让其它插件的注入挂件。
     /// </summary>
     public bool ShowCountdownOverlay { get; set; } = true;
 
-    /// <summary>挂件本地 HTTP 服务起始端口（被占用时自动向后扫描，共 20 个；避开 TokenStats 的 18790 段）</summary>
-    public int OverlayHttpPort { get; set; } = 18810;
+    /// <summary>挂件显示模式：false=显示剩余倒计时（默认），true=显示下次活跃时刻</summary>
+    public bool OverlayClockMode { get; set; }
 
-    /// <summary>挂件与相邻元素（『展开思考』开关、其它插件挂件）的间距（像素）</summary>
-    public int OverlayGap { get; set; } = 10;
+    /// <summary>是否在胶囊上显示「本间隔进度环」</summary>
+    public bool OverlayShowRing { get; set; } = true;
 
-    /// <summary>倒计时胶囊的自由摆放位置 X（像素；null=编组锚定）。拖动胶囊后自动保存，重启 Alife 保留。</summary>
+    /// <summary>多角色时是否在胶囊上显示角色名</summary>
+    public bool OverlayShowCharName { get; set; } = true;
+
+    /// <summary>挂件缩放百分比（60-160，默认 100）</summary>
+    public int OverlayScalePercent { get; set; } = 100;
+
+    /// <summary>挂件不透明度百分比（30-100，默认 100）</summary>
+    public int OverlayOpacityPercent { get; set; } = 100;
+
+    /// <summary>是否自动避让其它插件注入到页面的挂件（当前探测 TokenStats 的圆环）</summary>
+    public bool OverlayAvoidOtherWidgets { get; set; } = true;
+
+    /// <summary>倒计时胶囊的自由摆放位置 X（像素；null=跟随编组锚定）。拖动胶囊后自动保存，重启 Alife 保留。</summary>
     public double? OverlayPillX { get; set; }
 
-    /// <summary>倒计时胶囊的自由摆放位置 Y（像素；null=编组锚定）</summary>
+    /// <summary>倒计时胶囊的自由摆放位置 Y（像素；null=跟随编组锚定）</summary>
     public double? OverlayPillY { get; set; }
 
     #endregion

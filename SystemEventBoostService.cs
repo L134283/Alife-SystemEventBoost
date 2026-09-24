@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
 using Alife.Function.FunctionCaller;
+using Alife.Function.SystemEvent;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel.ChatCompletion;
 
@@ -17,19 +18,11 @@ namespace Alife.Plugin.SystemEventBoost;
 
 [Module(
     "主动事件增强版",
-    """
-    以官方主动事件机制为基础进行增强，让 AI 的自主活动更聪明、更懂主人：
-    - 定时任务：循环任务（每天/每周几）+ 临时任务（N 分钟后/后触发），让 AI 定时做任何事
-    - 游戏陪伴模式：固定间隔查看屏幕游戏画面，给予鼓励与建议
-    - 睡眠模式：设定时间内不再主动活动，直到主人发消息或倒计时结束
-    - DeepSeek 峰谷模式：高峰时段自动停止自主活跃，节省资源
-    - 勿扰模式：AI 自主活动但不打扰主人（禁止 speak/qchat 标签）
-    - 撒娇模式：更粘人主动找主人，可联动桌宠吸引注意
-    - 倒计时挂件：在对话面板实时显示距下次自主活跃的倒计时（多角色各自一枚胶囊，悬停可看详情并"催一下"）
-    全部模式可叠加同时生效，且可由 AI 通过自然语言自主开启/关闭。
-    """,
+    "定时任务、报点模式、工作模式与游戏/睡眠/峰谷/勿扰/撒娇等陪伴模式，外加对话窗口倒计时挂件；并实现官方 ISystemEventService（QQ 群聊/私聊消息直接重置报点倒计时）。详细说明见设置面板内的「插件说明」。",
+    url: "https://github.com/L134283/Alife-SystemEventBoost",
     defaultCategory: "Doro的妙妙工具",
     editorUI: typeof(SystemEventBoostServiceUI),
+    globalUI: typeof(CountdownOverlayWidget),
     launchOrder: 200)]
 public class SystemEventBoostService(
     XmlFunctionCaller functionService,
@@ -37,7 +30,8 @@ public class SystemEventBoostService(
     ConfigurationSystem configurationSystem,
     ILogger<SystemEventBoostService> logger) :
     ChatBehaviour,
-    IConfigurable<SystemEventBoostServiceConfig>
+    IConfigurable<SystemEventBoostServiceConfig>,
+    ISystemEventService
 {
     SystemEventBoostServiceConfig _configuration = null!;
     public SystemEventBoostServiceConfig Configuration
@@ -86,18 +80,19 @@ public class SystemEventBoostService(
     DateTime lastUserInteractionTime; // 最近真实互动时间（撒娇智能节流）
     string? scheduleFingerprint;      // 当前排期所用的「调度相关配置」指纹（见 BuildScheduleFingerprint）
 
-    // ===== 自有周期循环 + 框架循环看门狗 =====
-    // 框架的 ChatActivity.StartTimer 是"边遍历 container.Instances 边 await 各模块 UpdateAsync"，
-    // 而插件加载/卸载、角色配置变更会在别的线程就地增删同一个集合，撞上就抛
-    // "Collection was modified; enumeration operation may not execute"，被外层 catch 吞掉后
-    // 该角色的更新循环永久停止且永不重启：所有模块 OnUpdate 停摆，重载插件后新建的模块也永远等不到 OnStart
-    //（表现为：报点不再触发、重载插件后挂件消失且不恢复、桌宠等模块失去 OnStart 初始化）。
-    // 本插件的周期工作与挂件自愈因此改用自有循环，并在框架循环停摆时给出明确告警。
-    DateTime lastTickSeenTime;         // 框架更新循环最后一次调用本模块 OnUpdate 的时间
-    bool frameworkStarted;             // 框架是否调用过 OnStart（框架循环只由 ChatActivity.Start 启动）
-    bool frameworkStalled;             // 判定：框架更新循环已停止
-    DateTime loopStartedTime;          // 自有循环启动时间
-    CancellationTokenSource? loopCts;  // 自有循环的取消源
+    // ===== 框架更新循环 =====
+    // 4.5.3/4.5.4 曾用「自有周期循环 + 停摆看门狗」绕过框架的一个缺陷：
+    // ChatActivity.StartTimer 边遍历 container.Instances 边 await 各模块 UpdateAsync，
+    // 而插件加载/卸载、角色配置变更会在别的线程就地增删该集合，撞上就抛 Collection was modified
+    // 并被吞掉，该角色的更新循环永久停止且永不重启（报点停摆、重载插件后挂件不回来、其它模块失去 OnStart）。
+    // Alife.Client 4.5.0 已把容器遍历与增删用 containerLock 串行化（ChatActivity.StartTimer / OnModulesLoaded /
+    // OnModulesUnloaded / OnCharacterChangedAsync 全部加锁），根因消除，故 4.6.0 撤掉自有循环、
+    // 周期工作回归框架的 OnUpdate；只保留"长时间收不到更新回调"的只读告警（见 LastTickTime）。
+    DateTime lastTickTime;            // 框架更新循环最后一次调用本模块 OnUpdate 的时间（挂件据此告警）
+
+    // ===== 倒计时重置来源（接管 ISystemEventService 后由 QQ 插件驱动）=====
+    DateTime lastTimerResetTime;      // 最近一次重置倒计时的时刻（双路径去重用）
+    string lastResetSource = "";      // 最近一次重置倒计时的来源描述（供 UI / 挂件显示）
 
     // ===== 工作模式运行时状态 =====
     WorkPhase workPhase;              // 工作模式阶段
@@ -147,6 +142,27 @@ public class SystemEventBoostService(
     /// <summary>Awake 定点报时时间</summary>
     public DateTime? AwakeTime => awakeReminderTime;
 
+    /// <summary>距最近一次框架更新回调的秒数（供 UI / 挂件检测更新循环停摆）</summary>
+    public double TickAgeSeconds => (DateTime.Now - lastTickTime).TotalSeconds;
+
+    /// <summary>当前报点间隔已走过的百分比（0-100；睡眠/工作等无间隔概念的场景返回 0）</summary>
+    public double IntervalProgressPercent
+    {
+        get
+        {
+            double total = (nextActivityTime - lastScheduleTime).TotalMilliseconds;
+            if (total <= 0)
+                return 0;
+            return Math.Clamp((DateTime.Now - lastScheduleTime).TotalMilliseconds / total * 100, 0, 100);
+        }
+    }
+
+    /// <summary>最近一次倒计时重置的来源描述（如「群聊/私聊消息（QQ插件）」「主人对话」）</summary>
+    public string LastResetSource => lastResetSource;
+
+    /// <summary>最近一次倒计时重置的时刻</summary>
+    public DateTime? LastResetTime => lastTimerResetTime == default ? null : lastTimerResetTime;
+
     /// <summary>当前调度状态描述（供 UI 显示报点类型/抑制原因）</summary>
     public string ActivityStatus => ClassifyActivity().Text;
 
@@ -159,8 +175,9 @@ public class SystemEventBoostService(
     /// <summary>模式优先级判定（ActivityStatus 与 OverlayStateCode 的统一来源，避免两份逻辑改一处漏一处）</summary>
     (string Code, string Text) ClassifyActivity()
     {
-        //框架更新循环已停止：本插件靠自有循环仍在工作，但调度/报点已不可靠，给出明确状态而不是静默停摆
-        if (frameworkStalled)
+        //框架更新循环长时间没有回调本模块：周期工作已停摆。
+        //（4.5.0 已从根上修复容器并发导致的循环中断，这里只作只读告警，不再自己起循环兜底）
+        if (TickAgeSeconds > 30)
             return ("stall", "框架更新循环已停止·请停用后重新激活");
         if (IsWorkModeActive)
             return ("work", $"工作模式·{workPhase}");
@@ -228,7 +245,19 @@ public class SystemEventBoostService(
         Console.WriteLine($"[主动事件增强] 挂件位置已保存：[{CharacterName}] " + (x == null ? "归位" : $"({x:0},{y:0})"));
     }
 
-    /// <summary>构建挂件展示快照（HTTP /state 数据源；时间用 epoch 毫秒，挂件端只做差值不受时钟同步影响）</summary>
+    /// <summary>设置胶囊显示模式：true=显示下次活跃时刻，false=显示剩余倒计时。随角色配置持久化。</summary>
+    public void SetOverlayClockMode(bool clockMode)
+    {
+        if (Configuration.OverlayClockMode == clockMode)
+            return;
+        Configuration.OverlayClockMode = clockMode;
+        SaveConfig();
+    }
+
+    /// <summary>挂件上点击胶囊：在「剩余倒计时 / 时刻」之间切换</summary>
+    public void ToggleOverlayClockMode() => SetOverlayClockMode(Configuration.OverlayClockMode == false);
+
+    /// <summary>构建挂件展示快照（时间用 epoch 毫秒，挂件端只做差值，不受时钟同步影响）</summary>
     public OverlayCharSnapshot BuildOverlaySnapshot() => new()
     {
         Name = CharacterName,
@@ -243,6 +272,13 @@ public class SystemEventBoostService(
         WorkTotal = TotalWorkSteps,
         WorkTask = CurrentWorkTask,
         AwakeMs = AwakeTime == null ? null : new DateTimeOffset(AwakeTime.Value).ToUnixTimeMilliseconds(),
+        TickAgeSeconds = TickAgeSeconds,
+        ShowRing = Configuration.OverlayShowRing,
+        ShowCharName = Configuration.OverlayShowCharName,
+        ClockMode = Configuration.OverlayClockMode,
+        ScalePercent = Configuration.OverlayScalePercent,
+        OpacityPercent = Configuration.OverlayOpacityPercent,
+        AvoidOtherWidgets = Configuration.OverlayAvoidOtherWidgets,
         FreeX = Configuration.OverlayPillX,
         FreeY = Configuration.OverlayPillY,
     };
@@ -258,14 +294,12 @@ public class SystemEventBoostService(
         ChatBot.ChatReceived += OnChatReceived;
         ChatBot.ChatFinishedAsync += OnChatFinishedAsync;
 
-        //挂件注册 + 自有周期循环都放在唤醒阶段：框架更新循环若已停止（见字段注释），OnStart 永远不会被调用，
-        //把注册放在 OnStart 会导致"重载插件后挂件再也不出现"
+        //挂件注册放在唤醒阶段（OnAwake 早于 OnStart，且重载插件后能立刻重新注册）
         lastUserInteractionTime = DateTime.Now;
         nextActivityTime = DateTime.Now;
         lastScheduleTime = DateTime.Now;
-        lastTickSeenTime = DateTime.Now;
+        lastTickTime = DateTime.Now;
         CountdownOverlayManager.Register(this);
-        StartLoop();
         return Task.CompletedTask;
     }
 
@@ -274,6 +308,7 @@ public class SystemEventBoostService(
         lastUserInteractionTime = DateTime.Now;
         nextActivityTime = DateTime.Now;
         lastScheduleTime = DateTime.Now;
+        lastTickTime = DateTime.Now;
         awakeReminderTime = null;
 
         //按模式总开关过滤可用函数：关闭的模式不暴露给 AI
@@ -378,95 +413,18 @@ public class SystemEventBoostService(
     }
 
     /// <summary>
-    /// 框架每秒回调：这里只做看门狗。
-    /// 周期工作（报点/定时任务/睡眠/工作模式）与挂件自愈都已经搬进自有循环（见 <see cref="StartLoop"/>），
-    /// 这样即使框架的更新循环因并发修改容器异常而永久停止，本插件仍能正常工作。
+    /// 框架每秒回调：周期工作（报点 / 定时任务 / 睡眠 / Awake / 工作模式）都在这里推进。
+    /// 4.6.0 起不再自建循环：Alife.Client 4.5.0 已把容器遍历与增删串行化，循环中断的根因消除；
+    /// 这里只记录时间戳，供挂件/配置页在长时间收不到回调时给出只读告警。
     /// </summary>
     protected override Task OnUpdate()
     {
-        frameworkStarted = true;
-        lastTickSeenTime = DateTime.Now;
-        frameworkStalled = false;   //框架循环在跑（例如角色重新激活后），清掉告警状态
+        lastTickTime = DateTime.Now;
+        TickWorkMode();
+        TickAwakeReminder();
+        TickScheduledTasks();
+        TickActivity();
         return Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// 本插件自有周期循环（1 秒一次，随实例生命周期启停）。
-    /// 不用框架的 Update 回调是因为它可能永久停止：框架 ChatActivity.StartTimer 边遍历 container.Instances
-    /// 边 await 各模块 UpdateAsync，而插件加载/卸载与角色配置变更会在别的线程就地增删该集合，
-    /// 撞上就抛 Collection was modified 并被外层 catch 吞掉 → 该角色的更新循环停止且永不重启。
-    /// 后果是：所有模块不再被更新，且此后新建的模块永远等不到 OnStart（重载插件后挂件消失即此因）。
-    /// </summary>
-    void StartLoop()
-    {
-        CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(DestroyCancellationToken);
-        loopCts = cts;
-        loopStartedTime = DateTime.Now;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                while (cts.IsCancellationRequested == false)
-                {
-                    await Task.Delay(1000, cts.Token);
-                    try
-                    {
-                        //框架启动回调跑过之后再开始调度/报点，避免在角色激活过程中插话
-                        if (frameworkStarted)
-                        {
-                            TickWorkMode();
-                            TickAwakeReminder();
-                            TickScheduledTasks();
-                            TickActivity();
-                        }
-                        CheckFrameworkStall();
-                        _ = CountdownOverlayManager.EnsureAsync();   //挂件自愈（心跳驱动，稳态 0 次 IPC）
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "主动事件增强：周期循环单次执行失败");
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "主动事件增强：周期循环退出");
-            }
-        });
-    }
-
-    /// <summary>
-    /// 框架更新循环看门狗：发现它停摆就明确告警（本插件仍能工作，但其它模块不会恢复，需要重新激活角色）。
-    /// 判定一：OnStart 跑过却长时间收不到 OnUpdate（循环在运行中被打断）；
-    /// 判定二：唤醒后长时间收不到 OnStart（循环在插件重载前就已停止）。
-    /// </summary>
-    void CheckFrameworkStall()
-    {
-        if (frameworkStalled)
-            return;
-
-        if (frameworkStarted)
-        {
-            double idle = (DateTime.Now - lastTickSeenTime).TotalSeconds;
-            if (idle > 15)
-            {
-                frameworkStalled = true;
-                Console.WriteLine($"[主动事件增强][警告] 角色 [{CharacterName}] 的框架更新循环已停止（{idle:0} 秒未收到更新回调），"
-                    + "通常由插件加载/卸载或角色配置变更与框架遍历容器并发冲突（Collection was modified）导致。"
-                    + "本插件已改用自有循环继续工作，但要恢复其它模块请到角色页面「停用」后重新「激活」。");
-            }
-            return;
-        }
-
-        double sinceAwake = (DateTime.Now - loopStartedTime).TotalSeconds;
-        if (sinceAwake > 90)
-        {
-            frameworkStalled = true;
-            Console.WriteLine($"[主动事件增强][警告] 角色 [{CharacterName}] 已唤醒 {sinceAwake:0} 秒仍未收到框架启动回调（OnStart），"
-                + "框架更新循环可能已停止（常见于框架循环挂掉后才重载插件的场景）。"
-                + "本插件（报点、定时任务、挂件）仍会继续工作；如需恢复其它模块请「停用」后重新「激活」该角色。");
-        }
     }
 
     protected override async Task OnDestroy()
@@ -476,12 +434,37 @@ public class SystemEventBoostService(
         ChatBot.ChatReceived -= OnChatReceived;
         ChatBot.ChatFinishedAsync -= OnChatFinishedAsync;
 
-        loopCts?.Cancel();
-        loopCts?.Dispose();
-        loopCts = null;
         CountdownOverlayManager.Unregister(this);
 
         await interactor.ChatAsync($"程序关闭中。{Configuration.DestroyPrompt}");
+    }
+
+    #endregion
+
+    #region 系统事件接口（替代官方「主动事件」插件）
+
+    /// <summary>
+    /// Alife.Function.SystemEvent 的 <see cref="ISystemEventService"/> 实现：
+    /// QQ 插件（v4.4.0+）在收到群聊消息、以及非主人的私聊消息时调用它，用于重置周期报点倒计时。
+    /// 语义与官方实现一致（清零连续触发次数并重新计时），另外：
+    /// - 睡眠中不重置（避免群消息打断睡眠，与官方"睡眠绝对压制"的定位一致）；
+    /// - 遵循本插件的「群聊消息重置倒计时」开关（关闭时群聊/他人私聊不打断自主活跃节奏）；
+    /// - 与 <see cref="OnChatSent"/> 的文本兜底识别共享 800ms 去重窗口，两条路径不会互相叠加。
+    /// </summary>
+    public void ResetTimer()
+    {
+        if (IsSleeping)
+            return;
+        if (Configuration.ResetCountdownOnGroupMessage == false)
+            return;
+        if (lastTimerResetTime != default && (DateTime.Now - lastTimerResetTime).TotalMilliseconds < 800)
+            return;   //QQ 插件事件与文本兜底识别会先后各触发一次，这里去重
+
+        lastTimerResetTime = DateTime.Now;
+        lastResetSource = "群聊/私聊消息（QQ 插件）";
+        continuousTimerCount = 0;
+        lastUserInteractionTime = DateTime.Now;
+        NextActivity();
     }
 
     #endregion
@@ -502,20 +485,20 @@ public class SystemEventBoostService(
         if (isSilencedGroup)
             return;
 
-        //群聊消息：是否重置周期报点由开关控制（默认开启；睡眠中不重置，避免群消息打断睡眠）
+        //群聊消息：是否重置周期报点由开关控制（默认开启；睡眠中不重置，避免群消息打断睡眠）。
+        //注意：QQ 插件 v4.4.0 起会通过 ISystemEventService.ResetTimer 直接通知本插件，
+        //这里的文本识别只作为"QQ 插件版本较旧 / 消息来自其它渠道"时的兜底，两条路径由 800ms 窗口去重。
         if (isGroup)
         {
-            if (Configuration.ResetCountdownOnGroupMessage == false || IsSleeping)
-                return;
-            continuousTimerCount = 0;
-            lastUserInteractionTime = DateTime.Now;
-            NextActivity();
+            ResetTimer();
             return;
         }
 
         //真实用户消息（主人对话）：重置周期报点 + 记录互动 + 唤醒睡眠
         continuousTimerCount = 0;
         lastUserInteractionTime = DateTime.Now;
+        lastResetSource = "主人对话";
+        lastTimerResetTime = DateTime.Now;
         NextActivity();
         WakeUp(silent: true);
     }
@@ -1842,7 +1825,7 @@ public class SystemEventBoostService(
         try
         {
             using HttpClient client = new() { Timeout = TimeSpan.FromSeconds(6) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("Alife-SystemEventBoost/4.5.4");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Alife-SystemEventBoost/4.6.0");
             string json = await client.GetStringAsync($"https://timor.tech/api/holiday/year/{year}");
             Dictionary<string, HolidayRange> fetched = ParseHolidayJson(json);
             if (fetched.Count == 0)

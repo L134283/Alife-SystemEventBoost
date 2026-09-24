@@ -40,6 +40,29 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
     // ========== 实时状态刷新 ==========
     System.Timers.Timer? _refreshTimer;
 
+    // ========== 可折叠区块 ==========
+    /// <summary>「插件说明」是否展开（默认收起，避免长篇说明常驻占屏）</summary>
+    bool _introOpen;
+
+    /// <summary>用户手动开合过的区块（没动过的区块跟随对应的模式总开关自动收起/展开）</summary>
+    readonly Dictionary<string, bool> _sectionOpen = new();
+
+    /// <summary>插件完整说明（模块属性的说明只留一句话，长文搬到这里由用户点开看）</summary>
+    const string PluginIntro = """
+        以官方主动事件机制为基础进行增强，让 AI 的自主活动更聪明、更懂主人：
+        - 定时任务：循环任务（每天/每周几）+ 临时任务（N 分钟后触发），让 AI 定时做任何事
+        - 游戏陪伴模式：固定间隔查看屏幕游戏画面，给予鼓励与建议
+        - 睡眠模式：设定时间内不再主动活动，直到主人发消息或倒计时结束
+        - DeepSeek 峰谷模式：高峰时段自动停止自主活跃，节省资源
+        - 勿扰模式：AI 自主活动但不打扰主人（禁止 speak/qchat 标签）
+        - 撒娇模式：更粘人主动找主人，可联动桌宠吸引注意
+        - 工作模式：列出计划、逐步执行、像专业 Agent 一样把活干完
+        - 倒计时挂件：在对话窗口实时显示距下次自主活跃的倒计时（多角色各自一枚胶囊，悬停可看详情并"催一下"）
+        本插件还实现了官方的 ISystemEventService 接口，作为官方「主动事件」插件的替代实现：
+        QQ 插件收到群聊/私聊消息时重置周期报点的动作会直接落到本插件。
+        全部模式可叠加同时生效，且可由 AI 通过自然语言自主开启/关闭。
+        """;
+
     /// <summary>Module 可能为 null（角色未激活时），提供安全访问</summary>
     SystemEventBoostService? SafeModule => Module;
 
@@ -78,6 +101,40 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
 
     /// <summary>是否处于角色配置上下文（Character 非空）</summary>
     bool IsCharacterContext => Character != null;
+
+    /// <summary>挂件全局运行状态（注册了几个角色、是否显示中）</summary>
+    string OverlayStatusText => CountdownOverlayManager.StatusText;
+
+    /// <summary>本角色的胶囊是否已被拖到自由位置</summary>
+    bool IsPillFree => Configuration?.OverlayPillX != null;
+
+    /// <summary>把本角色胶囊归位到编组（清掉自由位置并立即落盘）</summary>
+    void ResetPillPosition()
+    {
+        if (Configuration == null)
+            return;
+        Configuration.OverlayPillX = null;
+        Configuration.OverlayPillY = null;
+        SafeModule?.SetOverlayPillPosition(null, null);
+        StateHasChanged();
+    }
+
+    /// <summary>上次倒计时重置的展示文案（来源 + 时间）</summary>
+    string LastResetText
+    {
+        get
+        {
+            if (SafeModule is not { } module
+                || module.LastResetTime is not DateTime t
+                || string.IsNullOrEmpty(module.LastResetSource))
+                return "暂无记录（收到群聊/私聊或主人消息后记录）";
+            TimeSpan ago = DateTime.Now - t;
+            string agoText = ago.TotalMinutes < 1 ? $"{Math.Max(0, (int)ago.TotalSeconds)} 秒前"
+                : ago.TotalHours < 1 ? $"{(int)ago.TotalMinutes} 分钟前"
+                : $"{(int)ago.TotalHours} 小时前";
+            return $"{module.LastResetSource} · {t:HH:mm:ss}（{agoText}）";
+        }
+    }
 
     bool IsReportModeActive(string? name)
     {
@@ -370,10 +427,38 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         __builder.CloseElement();
 
-        // ========== 官方插件冲突提示（醒目） ==========
+        // ========== 插件说明（折叠：模块属性上的说明只留一句话，完整长文放这里，点开才占屏） ==========
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "margin-top:14px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-card");
+        __builder.AddAttribute(s++, "style", "padding:14px 18px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;user-select:none;");
+        __builder.AddAttribute(s++, "onclick", () => { _introOpen = !_introOpen; StateHasChanged(); });
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "display:flex;align-items:center;gap:8px;font-weight:700;color:#7c2d5a;");
+        __builder.AddContent(s++, "📖 插件说明");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "span");
+        __builder.AddAttribute(s++, "style", "font-size:12px;font-weight:600;color:#ec4899;background:#fdf1f7;border:1px solid #f8d6e8;border-radius:999px;padding:2px 10px;white-space:nowrap;");
+        __builder.AddContent(s++, _introOpen ? "▾ 收起" : "▸ 展开");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        if (_introOpen)
+        {
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "style", "margin-top:10px;font-size:12px;line-height:1.8;color:#7c5c6b;white-space:pre-wrap;word-break:break-word;");
+            __builder.AddContent(s++, PluginIntro);
+            __builder.CloseElement();
+        }
+        __builder.CloseElement();
+        __builder.CloseElement();
+
+        // ========== 系统事件接口接管状态（醒目） ==========
         if (HasOfficialSystemEvent)
         {
-            // 官方插件仍启用：红色醒目警告
+            // 官方插件仍启用：红色醒目警告（接口被官方占用 + 双套报点）
             __builder.OpenElement(s++, "div");
             __builder.AddAttribute(s++, "style", "margin-top:14px;");
             __builder.OpenComponent<Alert>(s++);
@@ -382,14 +467,16 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             __builder.AddComponentParameter(s++, "Style", "border-radius:14px;font-weight:600;border-color:#ff7875;background:#fff1f0;");
             __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
             {
-                b.AddContent(0, "⚠️ 请关闭官方「主动事件」插件（Alife.Function.SystemEvent）：它与本插件功能重叠，同时启用会导致双套周期报点冲突！请在角色模块管理中取消勾选官方「主动事件」，并重启客户端使配置生效。");
+                b.AddContent(0, "⚠️ 官方「主动事件」插件仍启用：① 与本插件功能重叠，会出现双套周期报点；"
+                    + "② 系统事件接口（ISystemEventService）被官方实例占用，QQ 插件收到群聊/私聊消息时的「重置倒计时」会交给官方实现，"
+                    + "本插件的「群聊消息重置倒计时」开关不会生效。请在角色模块管理中取消勾选官方「主动事件」，并重启客户端使配置生效。");
             }));
             __builder.CloseComponent();
             __builder.CloseElement();
         }
         else if (IsCharacterContext)
         {
-            // 官方插件已关闭：绿色确认
+            // 官方插件已关闭：绿色确认（本插件接管系统事件接口）
             __builder.OpenElement(s++, "div");
             __builder.AddAttribute(s++, "style", "margin-top:14px;");
             __builder.OpenComponent<Alert>(s++);
@@ -398,7 +485,8 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             __builder.AddComponentParameter(s++, "Style", "border-radius:14px;border-color:#b7eb8f;background:#f6ffed;");
             __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
             {
-                b.AddContent(0, "✅ 官方「主动事件」插件已关闭，本插件是唯一的主动事件来源，配置正确。");
+                b.AddContent(0, "✅ 官方「主动事件」已关闭，本插件是唯一的主动事件来源，并已接管系统事件接口（ISystemEventService）："
+                    + "QQ 插件收到群聊消息 / 非主人私聊消息时会直接重置本插件的周期报点倒计时（需 Alife.Client ≥ 4.5.0 与 QQ 插件 ≥ 4.4.0）。");
             }));
             __builder.CloseComponent();
             __builder.CloseElement();
@@ -414,7 +502,8 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             __builder.AddComponentParameter(s++, "Style", "border-radius:14px;");
             __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
             {
-                b.AddContent(0, "⚠️ 使用本插件前请先关闭官方「主动事件」插件（Alife.Function.SystemEvent），避免双套周期报点冲突。");
+                b.AddContent(0, "⚠️ 使用本插件前请先关闭官方「主动事件」插件（Alife.Function.SystemEvent）：既避免双套周期报点冲突，"
+                    + "也让 QQ 插件的「收到群聊/私聊消息重置倒计时」落到本插件。");
             }));
             __builder.CloseComponent();
             __builder.CloseElement();
@@ -482,7 +571,46 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             __builder.AddContent(s++, $"定点报时 {awakeTime:HH:mm}");
             __builder.CloseElement();
         }
-        // 倒计时挂件开关（显示/隐藏对话面板挂件；关闭立即生效，重新开启会恢复显示，包括在挂件内手动隐藏的情况）
+        // 本间隔进度（与对话窗口挂件同源：lastScheduleTime → nextActivityTime）
+        if (SafeModule is { IsSleepingNow: false } live && live.CurrentWorkPhase == WorkPhase.None)
+        {
+            double progress = live.IntervalProgressPercent;
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "style", "width:100%;margin-top:10px;");
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "style", "height:8px;background:#f7e6ef;border-radius:99px;overflow:hidden;");
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "style", $"height:8px;border-radius:99px;min-width:2px;width:{progress:0.0}%;background:linear-gradient(90deg,#f9a8d4,#ec4899);");
+            __builder.CloseElement();
+            __builder.CloseElement();
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "style", "display:flex;justify-content:space-between;gap:10px;font-size:11px;color:#c48aa5;margin-top:4px;");
+            __builder.OpenElement(s++, "span");
+            __builder.AddContent(s++, $"本间隔进度 {progress:0}%");
+            __builder.CloseElement();
+            __builder.OpenElement(s++, "span");
+            __builder.AddContent(s++, $"当前节奏：{live.ActivityParamsText}");
+            __builder.CloseElement();
+            __builder.CloseElement();
+            __builder.CloseElement();
+        }
+
+        // 最近一次倒计时重置（QQ 插件收到群聊/私聊消息时通过 ISystemEventService 通知本插件）
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;margin-top:8px;background:#f7f9ff;border:1px solid #e3ecff;border-radius:12px;");
+        __builder.OpenElement(s++, "div");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#1d39c4;font-size:13px;");
+        __builder.AddContent(s++, "🔄 最近一次倒计时重置");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-size:11px;color:#8c9cc7;");
+        __builder.AddContent(s++, LastResetText);
+        __builder.CloseElement();
+        __builder.CloseElement();
+        __builder.CloseElement();
+
+        // 倒计时挂件（4.6.0 起由框架 globalUI 全局渲染，不再注入页面；这里控制本角色胶囊的显示与位置）
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;margin-top:8px;background:#fff5fa;border:1px solid #ffe3f0;border-radius:12px;");
         __builder.OpenElement(s++, "div");
@@ -492,17 +620,28 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "font-size:11px;color:#c48aa5;");
-        __builder.AddContent(s++, "拨动立即生效；保存后持久化。在挂件详情卡内也可隐藏");
+        __builder.AddContent(s++, $"对话窗口实时倒计时 · 全局状态：{OverlayStatusText} · 外观与位置见下方「倒计时挂件」");
         __builder.CloseElement();
         __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "display:flex;align-items:center;gap:10px;");
+        if (IsPillFree)
+        {
+            __builder.OpenElement(s++, "span");
+            __builder.AddAttribute(s++, "style", "font-size:11px;color:#c46a94;cursor:pointer;text-decoration:underline;");
+            __builder.AddAttribute(s++, "onclick", () => ResetPillPosition());
+            __builder.AddContent(s++, "胶囊归位");
+            __builder.CloseElement();
+        }
         RenderSwitch(__builder, ref s, Configuration?.ShowCountdownOverlay ?? true, v =>
         {
             if (Configuration == null) return;
             Configuration.ShowCountdownOverlay = v;
-            //立即推送到运行中的模块实例（挂件 1 秒内显示/隐藏，无需保存或重启角色；保存栏负责持久化）
+            //立即推送到运行中的模块实例（挂件下一拍即显示/隐藏，无需保存或重启角色；保存栏负责持久化）
             if (SafeModule is IConfigurable configurable)
                 configurable.Configuration = Configuration;
         });
+        __builder.CloseElement();
         __builder.CloseElement();
         __builder.CloseElement();
         __builder.CloseElement();
@@ -592,15 +731,23 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.AddAttribute(s++, "style", "flex:1;");
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;");
-        __builder.AddContent(s++, "群聊消息重置倒计时");
+        __builder.AddContent(s++, "群聊 / 私聊消息重置倒计时");
         __builder.CloseElement();
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-desc");
         __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
-        __builder.AddContent(s++, "开启：收到群聊消息也视为互动，重置周期报点倒计时并重新计算下次报点（睡眠中除外，避免群消息打断睡眠）；关闭：只有主人对话会重置，群聊消息不打断自主活跃节奏。");
+        __builder.AddContent(s++, "开启：QQ 插件收到群聊消息、或非主人的私聊消息时视为互动，重置周期报点倒计时并重新计算下次报点（睡眠中除外，避免群消息打断睡眠）；"
+            + "关闭：只有主人对话会重置，群聊/他人私聊不打断自主活跃节奏。"
+            + "该事件由 QQ 插件（≥ 4.4.0）通过系统事件接口通知本插件，本插件实现官方 ISystemEventService 作为替代（需关闭官方「主动事件」）；"
+            + "旧版 QQ 插件下本插件仍会用消息文本兜底识别，两条路径自动去重。");
         __builder.CloseElement();
         __builder.CloseElement();
         RenderSwitch(__builder, ref s, Configuration.ResetCountdownOnGroupMessage, v => Configuration.ResetCountdownOnGroupMessage = v);
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:8px 0 0 0;");
+        __builder.AddContent(s++, $"最近一次重置：{LastResetText}");
         __builder.CloseElement();
         __builder.CloseElement();
 
@@ -632,6 +779,86 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         RenderTextAreaCard(__builder, ref s, "启动报点", "程序启动/重载时附加发送的提示", Configuration.StartPrompt, v => Configuration.StartPrompt = v);
         RenderTextAreaCard(__builder, ref s, "关闭报点", "程序关闭时附加发送的提示", Configuration.DestroyPrompt, v => Configuration.DestroyPrompt = v);
         RenderTextAreaCard(__builder, ref s, "周期报点", "每次自主活跃报点时附加发送的提示（未启用自定义报点模式时生效）", Configuration.UpdatePrompt, v => Configuration.UpdatePrompt = v);
+        __builder.CloseElement();
+        __builder.CloseElement();
+
+        // ========== 倒计时挂件（全局窗口，每角色一枚胶囊） ==========
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-section");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-section-title");
+        __builder.AddMarkupContent(s++, "<span class=\"dot\"></span>");
+        __builder.AddContent(s++, "倒计时挂件");
+        __builder.CloseElement();
+
+        // 外观
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-card");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddContent(s++, "挂件由客户端全局渲染（框架 globalUI），在对话窗口右上角显示每个已激活角色的倒计时胶囊。以下外观设置按角色独立保存。");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;background:#fff5fa;border:1px solid #ffe3f0;border-radius:12px;");
+        __builder.OpenElement(s++, "div");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;");
+        __builder.AddContent(s++, "显示时刻而非剩余倒计时");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
+        __builder.AddContent(s++, "关闭：胶囊显示「距下次活跃的剩余时间」（默认）；开启：显示下次活跃的时刻。挂件内点击胶囊可随时切换。");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, Configuration.OverlayClockMode, v => Configuration.OverlayClockMode = v);
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-grid");
+        __builder.AddAttribute(s++, "style", "margin-top:12px;");
+        RenderSwitchRow(__builder, ref s, "显示间隔进度环", Configuration.OverlayShowRing, v => Configuration.OverlayShowRing = v);
+        RenderSwitchRow(__builder, ref s, "多角色时显示角色名", Configuration.OverlayShowCharName, v => Configuration.OverlayShowCharName = v);
+        RenderSwitchRow(__builder, ref s, "自动避让其它插件挂件", Configuration.OverlayAvoidOtherWidgets, v => Configuration.OverlayAvoidOtherWidgets = v);
+        RenderNumberField(__builder, ref s, "缩放 (%)", Configuration.OverlayScalePercent, 60, 160, v => Configuration.OverlayScalePercent = v, () => Configuration.OverlayScalePercent);
+        RenderNumberField(__builder, ref s, "透明度 (%)", Configuration.OverlayOpacityPercent, 30, 100, v => Configuration.OverlayOpacityPercent = v, () => Configuration.OverlayOpacityPercent);
+        __builder.CloseElement();
+        __builder.CloseElement();
+
+        // 位置与运行状态
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-card");
+        __builder.AddAttribute(s++, "style", "margin-top:14px;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "flex:1;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;");
+        __builder.AddContent(s++, "运行状态与胶囊位置");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
+        __builder.AddContent(s++, $"全局：{OverlayStatusText}；本角色胶囊："
+            + (IsPillFree ? $"自由摆放（{Configuration.OverlayPillX:0}, {Configuration.OverlayPillY:0}）" : "跟随右上角编组"));
+        __builder.CloseElement();
+        __builder.CloseElement();
+        __builder.OpenComponent<Button>(s++);
+        __builder.AddComponentParameter(s++, "Size", ButtonSize.Small);
+        __builder.AddComponentParameter(s++, "Disabled", IsPillFree == false);
+        __builder.AddComponentParameter(s++, "OnClick", EventCallback.Factory.Create<Microsoft.AspNetCore.Components.Web.MouseEventArgs>(this, ResetPillPosition));
+        __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
+        {
+            b.AddContent(0, "胶囊归位");
+        }));
+        __builder.CloseComponent();
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:10px 0 0 0;");
+        __builder.AddContent(s++, "交互：按住胶囊可拖到屏幕任意位置（位置随本角色配置持久化，重启 Alife 保留）· 双击归位 · 点击切换「剩余 / 时刻」· 悬停展开详情卡，"
+            + "卡内可「催一下」立即触发自主活跃（睡眠中转唤醒、工作模式转催促进度），也可单独隐藏本角色的倒计时。");
+        __builder.CloseElement();
         __builder.CloseElement();
         __builder.CloseElement();
 
@@ -751,11 +978,9 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         // ========== 二、定时任务 ==========
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-section");
-        __builder.OpenElement(s++, "div");
-        __builder.AddAttribute(s++, "class", "seb-section-title");
-        __builder.AddMarkupContent(s++, "<span class=\"dot\"></span>");
-        __builder.AddContent(s++, "定时任务");
-        __builder.CloseElement();
+        RenderCollapseTitle(__builder, ref s, "task", "定时任务", Configuration.MasterScheduledTask);
+        if (SectionOpen("task", Configuration.MasterScheduledTask))
+        {
 
         // 新增任务
         __builder.OpenElement(s++, "div");
@@ -978,6 +1203,8 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             __builder.CloseElement();
         }
         __builder.CloseElement();
+        }
+
         __builder.CloseElement();
 
         // ========== 三、陪伴模式 ==========
@@ -995,7 +1222,9 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         // 游戏模式
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
-        RenderModeHeader(__builder, ref s, "游戏陪伴", "固定间隔主动查看屏幕游戏画面，给予鼓励与建议", Configuration.GameModeEnabled, v => Configuration.GameModeEnabled = v);
+        RenderModeHeader(__builder, ref s, "game", "游戏陪伴", "固定间隔主动查看屏幕游戏画面，给予鼓励与建议", Configuration.GameModeEnabled, Configuration.MasterGameMode, v => Configuration.GameModeEnabled = v);
+        if (SectionOpen("game", Configuration.MasterGameMode))
+        {
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "margin-top:12px;");
         RenderNumberField(__builder, ref s, "查看间隔 (秒)", Configuration.GamePokeIntervalSeconds, 10, 3600, v => Configuration.GamePokeIntervalSeconds = v, () => Configuration.GamePokeIntervalSeconds);
@@ -1012,12 +1241,15 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.GamePrompt = v));
         __builder.CloseComponent();
         __builder.CloseElement();
+        }
         __builder.CloseElement();
 
         // 撒娇模式
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
-        RenderModeHeader(__builder, ref s, "撒娇", "更粘人主动找主人，可联动桌宠吸引注意", Configuration.CuteModeEnabled, v => Configuration.CuteModeEnabled = v);
+        RenderModeHeader(__builder, ref s, "cute", "撒娇", "更粘人主动找主人，可联动桌宠吸引注意", Configuration.CuteModeEnabled, Configuration.MasterCuteMode, v => Configuration.CuteModeEnabled = v);
+        if (SectionOpen("cute", Configuration.MasterCuteMode))
+        {
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "margin-top:12px;");
         __builder.OpenElement(s++, "div");
@@ -1042,6 +1274,7 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.CutePrompt = v));
         __builder.CloseComponent();
         __builder.CloseElement();
+        }
         __builder.CloseElement();
 
         __builder.CloseElement();
@@ -1062,28 +1295,18 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         // 睡眠模式
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
-        __builder.OpenElement(s++, "div");
-        __builder.AddAttribute(s++, "style", "display:flex;justify-content:space-between;align-items:flex-start;gap:10px;");
-        __builder.OpenElement(s++, "div");
-        __builder.OpenElement(s++, "div");
-        __builder.AddAttribute(s++, "style", "font-weight:700;color:#7c2d5a;");
-        __builder.AddContent(s++, "睡眠");
-        __builder.CloseElement();
-        __builder.OpenElement(s++, "div");
-        __builder.AddAttribute(s++, "class", "seb-desc");
-        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
-        __builder.AddContent(s++, "设定时间内 AI 不再主动活动，直到主人发消息或倒计时结束");
-        __builder.CloseElement();
-        __builder.CloseElement();
+        RenderModeHeader(__builder, ref s, "sleep", "睡眠", "设定时间内 AI 不再主动活动，直到主人发消息或倒计时结束，由 AI 按需进入", true, Configuration.MasterSleepMode, null);
+        if (SectionOpen("sleep", Configuration.MasterSleepMode))
+        {
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.AddAttribute(s++, "style", "margin-top:12px;");
         __builder.OpenElement(s++, "span");
         __builder.AddAttribute(s++, "class", "seb-label");
         __builder.AddAttribute(s++, "style", "margin:0;");
         __builder.AddContent(s++, "群聊静默");
         __builder.CloseElement();
         RenderSwitch(__builder, ref s, Configuration.SleepSilentGroup, v => Configuration.SleepSilentGroup = v);
-        __builder.CloseElement();
         __builder.CloseElement();
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "margin-top:12px;");
@@ -1109,12 +1332,15 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.SleepGroupSilencePrompt = v));
         __builder.CloseComponent();
         __builder.CloseElement();
+        }
         __builder.CloseElement();
 
         // 勿扰模式
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
-        RenderModeHeader(__builder, ref s, "勿扰", "AI 自主活动但不打扰主人（禁止 speak/qchat 打扰标签）", Configuration.DndModeEnabled, v => Configuration.DndModeEnabled = v);
+        RenderModeHeader(__builder, ref s, "dnd", "勿扰", "AI 自主活动但不打扰主人（禁止 speak/qchat 打扰标签）", Configuration.DndModeEnabled, Configuration.MasterDndMode, v => Configuration.DndModeEnabled = v);
+        if (SectionOpen("dnd", Configuration.MasterDndMode))
+        {
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "margin-top:12px;");
         __builder.OpenElement(s++, "span");
@@ -1139,12 +1365,15 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.DndPokeText = v));
         __builder.CloseComponent();
         __builder.CloseElement();
+        }
         __builder.CloseElement();
 
         // 峰谷模式
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
-        RenderModeHeader(__builder, ref s, "DeepSeek 峰谷", "高峰时段自动停止自主活跃，节省推理资源", Configuration.PeakModeEnabled, v => Configuration.PeakModeEnabled = v);
+        RenderModeHeader(__builder, ref s, "peak", "DeepSeek 峰谷", "高峰时段自动停止自主活跃，节省推理资源", Configuration.PeakModeEnabled, Configuration.MasterPeakMode, v => Configuration.PeakModeEnabled = v);
+        if (SectionOpen("peak", Configuration.MasterPeakMode))
+        {
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-row");
         __builder.AddAttribute(s++, "style", "margin-top:10px;");
@@ -1396,6 +1625,7 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         RenderSwitch(__builder, ref s, Configuration.PeakHolidayAutoFetch, v => Configuration.PeakHolidayAutoFetch = v);
         __builder.CloseElement();
         __builder.CloseElement();
+        }
         __builder.CloseElement();
 
         __builder.CloseElement();
@@ -1404,11 +1634,9 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         // ========== 五、工作模式 ==========
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-section");
-        __builder.OpenElement(s++, "div");
-        __builder.AddAttribute(s++, "class", "seb-section-title");
-        __builder.AddMarkupContent(s++, "<span class=\"dot\"></span>");
-        __builder.AddContent(s++, "工作模式");
-        __builder.CloseElement();
+        RenderCollapseTitle(__builder, ref s, "work", "工作模式", Configuration.MasterWorkMode);
+        if (SectionOpen("work", Configuration.MasterWorkMode))
+        {
 
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
@@ -1501,6 +1729,7 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         __builder.CloseElement();
         __builder.CloseElement();
+        }
         __builder.CloseElement();
 
         // ========== 尾部 ==========
@@ -1691,15 +1920,21 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         b.CloseElement();
     }
 
-    /// <summary>模式卡片头部：标题 + 说明 + 开关</summary>
-    void RenderModeHeader(RenderTreeBuilder b, ref int s, string title, string desc, bool enabled, Action<bool> setter)
+    /// <summary>
+    /// 模式卡片头部：标题 + 说明 + 模式开关 + 展开/收起按钮。
+    /// 展开按钮只管内容显示，不动任何开关；区块默认展开状态跟随对应的「模式总开关」
+    /// （总开关关掉的模式自动收起，点开按钮可以照常查看/编辑内容）。
+    /// </summary>
+    void RenderModeHeader(RenderTreeBuilder b, ref int s, string key, string title, string desc, bool enabled, bool masterOn, Action<bool>? setter)
     {
         b.OpenElement(s++, "div");
         b.AddAttribute(s++, "style", "display:flex;justify-content:space-between;align-items:flex-start;gap:10px;");
         b.OpenElement(s++, "div");
         b.OpenElement(s++, "div");
-        b.AddAttribute(s++, "style", "font-weight:700;color:#7c2d5a;");
+        b.AddAttribute(s++, "style", "font-weight:700;color:#7c2d5a;display:flex;align-items:center;gap:8px;");
         b.AddContent(s++, title);
+        if (masterOn == false)
+            RenderStatusChip(b, ref s, "总开关已关", "#bfa3b1");
         b.CloseElement();
         b.OpenElement(s++, "div");
         b.AddAttribute(s++, "class", "seb-desc");
@@ -1707,7 +1942,55 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         b.AddContent(s++, desc);
         b.CloseElement();
         b.CloseElement();
-        RenderSwitch(b, ref s, enabled, setter);
+        b.OpenElement(s++, "div");
+        b.AddAttribute(s++, "style", "display:flex;align-items:center;gap:8px;flex:0 0 auto;");
+        if (setter != null)
+            RenderSwitch(b, ref s, enabled, setter);
+        RenderCollapseToggle(b, ref s, key, masterOn);
+        b.CloseElement();
+        b.CloseElement();
+    }
+
+    /// <summary>区块是否展开：用户手动开合过就按用户的，否则跟随模式总开关</summary>
+    bool SectionOpen(string key, bool masterOn)
+        => _sectionOpen.TryGetValue(key, out bool v) ? v : masterOn;
+
+    void ToggleSection(string key, bool masterOn)
+    {
+        _sectionOpen[key] = SectionOpen(key, masterOn) == false;
+        StateHasChanged();
+    }
+
+    /// <summary>展开/收起小按钮（纯文字箭头，仅切换内容显示，不影响任何开关）</summary>
+    void RenderCollapseToggle(RenderTreeBuilder b, ref int s, string key, bool masterOn)
+    {
+        b.OpenElement(s++, "span");
+        b.AddAttribute(s++, "style",
+            "cursor:pointer;font-size:12px;font-weight:600;color:#ec4899;background:#fdf1f7;" +
+            "border:1px solid #f8d6e8;border-radius:999px;padding:2px 10px;white-space:nowrap;user-select:none;");
+        b.AddAttribute(s++, "title", "只展开/收起本区块内容，不影响总开关");
+        b.AddAttribute(s++, "onclick", () => ToggleSection(key, masterOn));
+        b.AddContent(s++, SectionOpen(key, masterOn) ? "▾ 收起" : "▸ 展开");
+        b.CloseElement();
+    }
+
+    /// <summary>整块可折叠区块的标题行（带模式总开关状态与展开按钮）</summary>
+    void RenderCollapseTitle(RenderTreeBuilder b, ref int s, string key, string title, bool masterOn)
+    {
+        b.OpenElement(s++, "div");
+        b.AddAttribute(s++, "class", "seb-section-title");
+        b.AddAttribute(s++, "style", "justify-content:space-between;flex-wrap:wrap;");
+        b.OpenElement(s++, "div");
+        b.AddAttribute(s++, "style", "display:flex;align-items:center;gap:8px;");
+        b.AddMarkupContent(s++, "<span class=\"dot\"></span>");
+        b.AddContent(s++, title);
+        b.CloseElement();
+        b.OpenElement(s++, "div");
+        b.AddAttribute(s++, "style", "display:flex;align-items:center;gap:8px;");
+        if (masterOn == false)
+            RenderStatusChip(b, ref s, "总开关已关", "#bfa3b1");
+        RenderCollapseToggle(b, ref s, key, masterOn);
+        b.CloseElement();
         b.CloseElement();
     }
 
@@ -1718,5 +2001,18 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         b.AddComponentParameter(s++, "Checked", RuntimeHelpers.TypeCheck(value));
         b.AddComponentParameter(s++, "CheckedChanged", EventCallback.Factory.Create<bool>(this, setter));
         b.CloseComponent();
+    }
+
+    /// <summary>带标签的开关行（挂件外观设置用）</summary>
+    void RenderSwitchRow(RenderTreeBuilder b, ref int s, string label, bool value, Action<bool> setter)
+    {
+        b.OpenElement(s++, "div");
+        b.AddAttribute(s++, "style", "display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;background:#fff5fa;border:1px solid #ffe3f0;border-radius:12px;");
+        b.OpenElement(s++, "span");
+        b.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;font-size:13px;");
+        b.AddContent(s++, label);
+        b.CloseElement();
+        RenderSwitch(b, ref s, value, setter);
+        b.CloseElement();
     }
 }
