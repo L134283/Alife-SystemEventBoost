@@ -76,7 +76,9 @@ public class SystemEventBoostService(
     DateTime? sleepUntil;             // 睡眠结束时间（null=未设置倒计时）
     bool sleepWaitForUser;            // 睡眠等待主人消息唤醒
     bool groupSilenceFlag;            // 本次Chat是否被睡眠静默占位改写（防误判唤醒）
-    bool wasSleeping;                 // 上一次检测的睡眠状态（用于睡眠结束时的唤醒提示）
+    bool sleepWakePending;            // 睡醒提示待发送：到点自动醒→随本轮报点发出；主人先发消息→并入那条消息
+    bool handlersBound;               // ChatBot 事件是否已绑定（OnAwake 可能被热重载重复调用）
+    bool reportPromptPreInjected;     // 本次启动是否已把报点提示词预注入系统提示词（对齐官方闲时行动建议预注入）
     DateTime lastUserInteractionTime; // 最近真实互动时间（撒娇智能节流）
     string? scheduleFingerprint;      // 当前排期所用的「调度相关配置」指纹（见 BuildScheduleFingerprint）
 
@@ -169,6 +171,17 @@ public class SystemEventBoostService(
     /// <summary>角色名（倒计时挂件注册键）</summary>
     public string CharacterName => Character?.Name ?? "";
 
+    /// <summary>角色是否同时启用了官方「主动事件」（功能重叠，双套报点）</summary>
+    public bool OfficialSystemEventEnabled =>
+        Character?.Modules?.Contains("Alife.Function.SystemEvent.SystemEventService") ?? false;
+
+    /// <summary>
+    /// 角色是否启用了官方 5.x 的「定时任务」插件（Alife.Function.TimedTask，提供同名 &lt;Awake&gt;/&lt;Await&gt;）。
+    /// 启用时本插件不再注册这两个函数，避免同名处理器被执行两次（双倍报点/重复计时）。
+    /// </summary>
+    public bool OfficialTimedTaskEnabled =>
+        Character?.Modules?.Contains("Alife.Function.SystemEvent.TimedTaskService") ?? false;
+
     /// <summary>挂件状态码：period/sleep/work/game/cute/dnd/peak（决定挂件配色）</summary>
     public string OverlayStateCode => ClassifyActivity().Code;
 
@@ -206,6 +219,8 @@ public class SystemEventBoostService(
         if (IsSleeping)
         {
             WakeUp(silent: false);
+            nextActivityTime = DateTime.Now;   //唤醒的同时立即排一轮报点，不用等到下一个间隔
+            lastScheduleTime = DateTime.Now;
             Console.WriteLine($"[主动事件增强] 挂件催一下：唤醒睡眠角色 [{CharacterName}]");
             return;
         }
@@ -289,10 +304,15 @@ public class SystemEventBoostService(
 
     protected override Task OnAwake()
     {
-        ChatBot.ChatSent += OnChatSent;
-        ChatBot.ChatSend += OnChatSend;
-        ChatBot.ChatReceived += OnChatReceived;
-        ChatBot.ChatFinishedAsync += OnChatFinishedAsync;
+        //热重载时同一实例可能被重复 Awake（实测可相隔数秒两次），事件绑定做幂等保护
+        if (handlersBound == false)
+        {
+            ChatBot.ChatSent += OnChatSent;
+            ChatBot.ChatSend += OnChatSend;
+            ChatBot.ChatReceived += OnChatReceived;
+            ChatBot.ChatFinishedAsync += OnChatFinishedAsync;
+            handlersBound = true;
+        }
 
         //挂件注册放在唤醒阶段（OnAwake 早于 OnStart，且重载插件后能立刻重新注册）
         lastUserInteractionTime = DateTime.Now;
@@ -312,9 +332,20 @@ public class SystemEventBoostService(
         awakeReminderTime = null;
 
         //按模式总开关过滤可用函数：关闭的模式不暴露给 AI
+        bool officialTimedTask = OfficialTimedTaskEnabled;
         var enabledFunctions = new XmlHandler(this).Functions
             .Where(f => IsModeFunctionAllowed(f.Name))
+            //官方 5.x 拆出了「定时任务」插件（Alife.Function.TimedTask），同样提供 <Awake>/<Await>。
+            //XmlFunctionCaller 对同名函数会依次执行所有处理器，两边都注册会导致双倍报点/重复计时，
+            //所以检测到官方插件启用时让出这两个函数，由官方实现负责。
+            .Where(f => officialTimedTask == false
+                || (string.Equals(f.Name, "Awake", StringComparison.OrdinalIgnoreCase) == false
+                    && string.Equals(f.Name, "Await", StringComparison.OrdinalIgnoreCase) == false))
             .ToList();
+        if (officialTimedTask)
+            Console.WriteLine($"[主动事件增强] 检测到官方「定时任务」插件已启用：[{CharacterName}] 本插件的 <Awake>/<Await> 不再注册（避免同名函数重复执行）");
+        if (OfficialSystemEventEnabled)
+            Console.WriteLine($"[主动事件增强] 警告：官方「主动事件」插件同时启用：[{CharacterName}] 会出现双套周期报点，且系统事件接口被官方占用，建议只在角色模块里启用本插件");
 
         //核心硬规则（常时注入）：总纲 + 触发词速查，按总开关过滤
         StringBuilder hard = new();
@@ -339,7 +370,10 @@ public class SystemEventBoostService(
         if (Configuration.MasterWorkMode || Configuration.MasterSleepMode || Configuration.MasterDndMode || Configuration.MasterPeakMode || Configuration.MasterGameMode || Configuration.MasterCuteMode)
             detail.AppendLine("- 模式优先级：工作模式 > 睡眠 > 勿扰 > 峰谷 > 游戏陪伴 > 撒娇；工作/睡眠期间不进行其他主动报点");
         if (Configuration.MasterSleepMode)
-            detail.AppendLine("- 睡眠：倒计时结束自动恢复；开启「群聊静默」后睡眠期间群聊消息被替换为占位，AI 不回复、不打扰");
+            detail.AppendLine("- 睡眠：到设定时间会自动睡醒（无需主人叫醒）；睡眠期间主人先发消息则直接视为醒来的那一轮，睡醒提示会并入主人消息；"
+                + "开启「群聊静默」后睡眠期间群聊消息被替换为占位，AI 不回复、不打扰");
+        if (officialTimedTask)
+            detail.AppendLine("- 定时报时/等待由官方「定时任务」插件提供，本插件不再重复提供 <Awake>/<Await>；日常提醒请用本插件的 <CreateScheduledTask>/<CreateOneTimeTask>");
         if (Configuration.MasterDndMode)
             detail.AppendLine("- 勿扰：自主活动但禁止 speak/qchat 等打扰标签，可按「允许做的事」清单自娱自乐");
         if (Configuration.MasterPeakMode)
@@ -379,10 +413,19 @@ public class SystemEventBoostService(
             functionService.RegisterHandlerWithoutDocument(planHandler, DestroyCancellationToken);
         }
 
+        //对齐官方 5.x 的「闲时行动建议预注入」：开启时把报点提示词一次性注入系统提示词（省 token），
+        //报点消息里只写「请参考【闲时行动建议】」；关闭时按旧行为在每次报点内联提示词。
+        //自定义报点模式的提示词随模式切换，始终内联，不在这里预注入。
+        reportPromptPreInjected = Configuration.UpdatePromptPreInject
+            && string.IsNullOrWhiteSpace(Configuration.UpdatePrompt) == false;
+        string reportPromptInjection = reportPromptPreInjected
+            ? $"\n\n【闲时行动建议】\n{Configuration.UpdatePrompt}"
+            : "";
+
         if (Configuration.ImplicitInjection)
-            interactor.Prompt(hardRules + implicitNote);
+            interactor.Prompt(hardRules + implicitNote + reportPromptInjection);
         else
-            interactor.Prompt(hardRules + detailedRules);
+            interactor.Prompt(hardRules + detailedRules + reportPromptInjection);
 
         //发送系统启动消息（继承官方行为）
         {
@@ -413,13 +456,15 @@ public class SystemEventBoostService(
     }
 
     /// <summary>
-    /// 框架每秒回调：周期工作（报点 / 定时任务 / 睡眠 / Awake / 工作模式）都在这里推进。
-    /// 4.6.0 起不再自建循环：Alife.Client 4.5.0 已把容器遍历与增删串行化，循环中断的根因消除；
+    /// 框架更新循环回调（5.x 为 ChatActivity.StartTimer，约 0.3s 一跳）：周期工作（睡眠判定 / 报点 / 定时任务 / Awake / 工作模式）都在这里推进。
+    /// 5.0.0 起不再自建循环：Alife.Client 5.x 会把容器遍历与增删串行化，循环中断的根因消除；
     /// 这里只记录时间戳，供挂件/配置页在长时间收不到回调时给出只读告警。
     /// </summary>
     protected override Task OnUpdate()
     {
         lastTickTime = DateTime.Now;
+        //睡醒判定必须放在最前面：不受工作模式/下次活跃时刻/峰谷抑制影响，到点必定清睡眠状态并排一轮醒来报点
+        TickSleep();
         TickWorkMode();
         TickAwakeReminder();
         TickScheduledTasks();
@@ -427,16 +472,35 @@ public class SystemEventBoostService(
         return Task.CompletedTask;
     }
 
-    protected override async Task OnDestroy()
+    /// <summary>
+    /// 框架 5.x 生命周期：OnEnd 在角色活动停止前调用（此时各模块仍正常工作），
+    /// 官方模块的告别消息也在这里发；事件退订/挂件注销仍留在 OnDestroy。
+    /// </summary>
+    protected override async Task OnEnd()
     {
-        ChatBot.ChatSent -= OnChatSent;
-        ChatBot.ChatSend -= OnChatSend;
-        ChatBot.ChatReceived -= OnChatReceived;
-        ChatBot.ChatFinishedAsync -= OnChatFinishedAsync;
+        try
+        {
+            await interactor.ChatAsync($"程序关闭中。{Configuration.DestroyPrompt}");
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "发送关闭提示失败");
+        }
+    }
+
+    protected override Task OnDestroy()
+    {
+        if (handlersBound)
+        {
+            ChatBot.ChatSent -= OnChatSent;
+            ChatBot.ChatSend -= OnChatSend;
+            ChatBot.ChatReceived -= OnChatReceived;
+            ChatBot.ChatFinishedAsync -= OnChatFinishedAsync;
+            handlersBound = false;
+        }
 
         CountdownOverlayManager.Unregister(this);
-
-        await interactor.ChatAsync($"程序关闭中。{Configuration.DestroyPrompt}");
+        return Task.CompletedTask;
     }
 
     #endregion
@@ -494,15 +558,27 @@ public class SystemEventBoostService(
             return;
         }
 
-        //真实用户消息（主人对话）：重置周期报点 + 记录互动 + 唤醒睡眠
+        //真实用户消息（主人对话）：重置周期报点 + 记录互动 + 结束睡眠
+        //睡醒提示已在 OnChatSend 阶段并入这条用户消息，这里只清状态，不再额外 Poke 一轮。
         continuousTimerCount = 0;
         lastUserInteractionTime = DateTime.Now;
         lastResetSource = "主人对话";
         lastTimerResetTime = DateTime.Now;
         NextActivity();
-        WakeUp(silent: true);
+
+        if (IsSleeping || sleepWakePending)
+        {
+            EndSleepState();
+            sleepWakePending = false;
+        }
     }
 
+    /// <summary>
+    /// 用户消息过滤器（框架 ChatBot.ChatSend，5.x 起提供）。在这里做两件事：
+    /// 1. 睡眠期间的群聊消息替换为静默占位；
+    /// 2. 睡眠期间主人先发消息 / 到点睡醒的提示尚未发出时，把「睡醒」提示直接追加到这条消息，
+    ///    让 AI 在本轮就知道自己已经醒了，避免回复完再补一条"已睡醒"（多一轮提醒、也很不自然）。
+    /// </summary>
     string OnChatSend(string message)
     {
         //睡眠模式：将群聊消息改写为静默占位，强约束 AI 不回复
@@ -511,7 +587,43 @@ public class SystemEventBoostService(
             groupSilenceFlag = true;
             return Configuration.SleepGroupSilencePrompt;
         }
+
+        //系统推送（报点/定时任务等）不算主人消息，不并入睡醒提示
+        if (message.Contains(ChatBot.PokeMessageTag))
+            return message;
+
+        string wakePrompt = Configuration.SleepWakePrompt;
+        bool alreadyAttached = string.IsNullOrWhiteSpace(wakePrompt) == false && message.Contains(wakePrompt);
+
+        //到点自动睡醒的提示还没发出（报点被高峰抑制/与 AI 活动碰撞延后），主人先开口：并入这条消息
+        if (sleepWakePending && alreadyAttached == false)
+        {
+            sleepWakePending = false;
+            EndSleepState();
+            Console.WriteLine($"[主动事件增强] 睡醒提示已并入主人消息（本轮）：[{CharacterName}]");
+            return AppendWakePrompt(message, wakePrompt);
+        }
+
+        if (alreadyAttached)
+            sleepWakePending = false;
+
+        //睡眠中主人先发消息：直接视为醒来的那一轮，睡眠状态立即结束，提示并入本条消息
+        if (IsSleeping)
+        {
+            EndSleepState();
+            sleepWakePending = false;
+            Console.WriteLine($"[主动事件增强] 睡眠中收到主人消息，已在本轮睡醒：[{CharacterName}]");
+            return AppendWakePrompt(message, wakePrompt);
+        }
+
         return message;
+    }
+
+    static string AppendWakePrompt(string message, string? wakePrompt)
+    {
+        if (string.IsNullOrWhiteSpace(wakePrompt))
+            return message;
+        return $"{message}\n{wakePrompt.Trim()}";
     }
 
     void OnChatReceived(string content)
@@ -780,14 +892,14 @@ public class SystemEventBoostService(
 
     void TickAwakeReminder()
     {
-        if (awakeReminderTime != null && DateTime.Now >= awakeReminderTime)
-        {
-            string remark = awakeReminderRemark;
-            awakeReminderTime = null;
-            awakeReminderRemark = "";
-            if (!IsSleeping)
-                interactor.Poke($"AWake报点：{remark}");
-        }
+        if (awakeReminderTime == null || DateTime.Now < awakeReminderTime)
+            return;
+        if (IsSleeping)
+            return;   //睡眠中到点：保留提醒，睡醒后再报（旧版会直接丢弃）
+        string remark = awakeReminderRemark;
+        awakeReminderTime = null;
+        awakeReminderRemark = "";
+        interactor.Poke($"AWake报点：{remark}");
     }
 
     void TickScheduledTasks()
@@ -859,6 +971,26 @@ public class SystemEventBoostService(
 
     #region 自主活跃调度（周期/游戏/撒娇/勿扰/峰谷叠加）
 
+    /// <summary>
+    /// 睡眠到期判定（每个 tick 在一切调度判断之前执行）。
+    /// 旧版把「睡醒提示」放在 TickActivity 的 nextActivityTime 之后、且靠 wasSleeping 状态延后发送：
+    /// 一旦主人在睡眠中先发消息（唤醒并清掉睡眠状态），提示仍会在那一轮对话结束后才补发，表现为多一轮「已睡醒」。
+    /// 现在改为：到点立即清睡眠状态 + 置睡醒待发标记，提示要么随本轮报点发出，要么并入主人消息（见 OnChatSend）。
+    /// </summary>
+    void TickSleep()
+    {
+        if (sleepUntil == null || DateTime.Now < sleepUntil.Value)
+            return;
+
+        sleepUntil = null;
+        sleepWaitForUser = false;
+        sleepWakePending = true;
+        continuousTimerCount = 0;
+        nextActivityTime = DateTime.Now;   //立即排一轮醒来报点，保证"到设定时间自动睡醒"
+        lastScheduleTime = DateTime.Now;
+        Console.WriteLine($"[主动事件增强] 睡眠时间到，自动唤醒：[{CharacterName}]");
+    }
+
     void TickActivity()
     {
         //配置指纹校验：框架既可能整体替换 Configuration 对象（走 setter 热应用），
@@ -877,22 +1009,24 @@ public class SystemEventBoostService(
         //睡眠：绝对压制，优先于一切时间检查（睡眠期间持续轮询刷新，确保倒计时结束后立即恢复）
         if (IsSleeping)
         {
-            wasSleeping = true;
             nextActivityTime = DateTime.Now.AddSeconds(10);
             return;
         }
 
-        if (DateTime.Now < nextActivityTime)
+        if (DateTime.Now < nextActivityTime && sleepWakePending == false)
             return;
 
-        //睡眠刚结束：发送睡醒提示，恢复正常活动
-        if (wasSleeping)
-        {
-            wasSleeping = false;
-            interactor.Poke("(已睡醒，恢复正常自主活动)");
-        }
-
         (TimeSpan interval, string? text) = ComposeActivity();
+
+        //到点自动睡醒：提示随本轮报点一起发出（不与报点分成两轮）；
+        //若此时正处于高峰抑制等「无报点」状态，也单独发一条睡醒提示，保证到点必定醒来。
+        if (sleepWakePending)
+        {
+            string wakeText = string.IsNullOrWhiteSpace(Configuration.SleepWakePrompt)
+                ? "(已睡醒，恢复正常自主活动)"
+                : Configuration.SleepWakePrompt.Trim();
+            text = string.IsNullOrEmpty(text) ? wakeText : $"{wakeText}\n{text}";
+        }
 
         if (string.IsNullOrEmpty(text))
         {
@@ -903,11 +1037,12 @@ public class SystemEventBoostService(
 
         if (functionService.IsIdle == false)
         {
-            nextActivityTime = DateTime.Now.Add(interval); //与AI活动碰撞，延迟重试
+            nextActivityTime = DateTime.Now.Add(interval); //与AI活动碰撞，延迟重试（保留睡醒提示，下次再发）
             lastScheduleTime = DateTime.Now;
             return;
         }
 
+        sleepWakePending = false;
         interactor.Poke(text);
         continuousTimerCount++;
         //用递增后的连续次数重新合成下次间隔：
@@ -944,10 +1079,20 @@ public class SystemEventBoostService(
         int interval = GetNextInterval(continuousTimerCount, Random.Shared.Next(-actOffset, actOffset));
 
         StringBuilder sb = new();
-        sb.Append("系统周期报点。");
-        sb.AppendLine(GetActiveReportPrompt());
+        if (reportPromptPreInjected && GetActiveReportMode() == null)
+        {
+            //预注入模式（对齐官方 5.x）：提示词已注入系统提示词，报点只做引用，省 token
+            sb.AppendLine("系统周期报点(请参考【闲时行动建议】)");
+        }
+        else
+        {
+            sb.AppendLine("系统周期报点。");
+            sb.AppendLine(GetActiveReportPrompt());
+        }
         if (continuousTimerCount >= actMaxRetry)
-            sb.Append($"(系统周期报点已达最大间隔时间，如果你想重新活跃一段时间，请使用<{nameof(Awake)}>来重置周期报点)");
+            sb.Append(Configuration.MasterAwake
+                ? $"(系统周期报点已达最大间隔时间，如果你想重新活跃一段时间，请使用<{nameof(Awake)}>来重置周期报点)"
+                : "(系统周期报点已达最大间隔时间，与主人聊几句即可重新活跃)");
 
         // ---- 撒娇模式：压缩间隔 + 促粘人（勿扰开启时被覆盖） ----
         if (IsCuteModeActive && IsDndActive == false)
@@ -1093,27 +1238,105 @@ public class SystemEventBoostService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("进入睡眠模式：设定时间内不再主动活动。支持指定唤醒时间、指定时长、或等待主人发消息唤醒。当主人说「我要睡觉了/晚安/明天X点叫我」时使用。")]
+    [Description("进入睡眠模式：设定时间内不再主动活动，到点会自动睡醒。支持指定唤醒时间、指定时长、或等待主人发消息唤醒。当主人说「我要睡觉了/晚安/明天X点叫我」时使用。")]
     public void GoSleep(
-        [Description("唤醒时间（ISO-8601格式，如2026-08-18T09:00:00），提供后以此为准")] DateTime? wakeupTime = null,
-        [Description("睡眠时长（分钟），wakeupTime为空时生效，默认480分钟(8小时)")] int? durationMinutes = null,
-        [Description("true=一直睡到主人发消息才唤醒（前两者均空时生效）")] bool waitForUser = false)
+        [Description("唤醒时间：ISO-8601（2026-11-24T07:00:00）、\"2026-11-24 07:00\"、或 \"07:00\"（今天该时刻，已过则按明天）；也支持 \"90m\"/\"2h\" 表示多少分钟/小时后")] string? wakeupTime = null,
+        [Description("睡眠时长（分钟），未提供唤醒时间时生效；两者都没有则使用默认睡眠时长")] int? durationMinutes = null,
+        [Description("true=一直睡到主人发消息才唤醒（仅在既没给唤醒时间、也没给时长时生效）")] bool waitForUser = false)
     {
-        DateTime? wake = wakeupTime;
-        if (wake == null && durationMinutes != null)
+        DateTime? wake = ParseWakeupTime(wakeupTime);
+        bool invalidTime = string.IsNullOrWhiteSpace(wakeupTime) == false && wake == null;
+
+        if (wake == null && durationMinutes is > 0)
             wake = DateTime.Now.AddMinutes(durationMinutes.Value);
+        //只有在「完全没给时间」时才进入等待主人消息模式：
+        //旧版只要 waitForUser=true 就会丢掉 wakeupTime，AI 一旦同时输出这两个参数就永远等不到自动睡醒。
+        bool usedDefaultDuration = false;
         if (wake == null && waitForUser == false)
+        {
             wake = DateTime.Now.AddHours(Configuration.SleepDefaultHours)
                 .AddMinutes(Configuration.SleepDefaultMinutes);
+            usedDefaultDuration = true;
+        }
 
-        sleepWaitForUser = waitForUser;
-        sleepUntil = waitForUser ? null : wake;
-        nextActivityTime = DateTime.Now.AddSeconds(10); //睡眠期间由TickActivity持续轮询刷新
+        //给的时间已过（例如模型算错日期）：立即醒来，而不是傻等一个永远不会到的时刻
+        if (wake != null && wake.Value <= DateTime.Now)
+        {
+            Console.WriteLine($"[主动事件增强] 唤醒时间已过（{wake:yyyy-MM-dd HH:mm}），按立即醒来处理：[{CharacterName}]");
+            wake = DateTime.Now.AddSeconds(2);
+        }
 
-        string desc = waitForUser
-            ? "将保持安静，直到主人发来消息才恢复"
-            : $"将在 {sleepUntil:yyyy-MM-dd HH:mm} 醒来";
-        interactor.Poke($"(已进入睡眠模式，{desc}。睡眠期间不会主动打扰，群聊消息也会静默处理)");
+        //睡眠会绝对压制一切主动报点/步骤提醒，工作模式继续跑只会在睡眠中弹进度催促，先收起
+        if (workPhase != WorkPhase.None)
+            FinishWorkMode(autoReport: false);
+
+        sleepWaitForUser = wake == null;
+        sleepUntil = wake;
+        sleepWakePending = false;
+        nextActivityTime = DateTime.Now.AddSeconds(10); //睡眠期间由 TickSleep/TickActivity 持续轮询刷新
+
+        StringBuilder sb = new();
+        sb.Append(sleepWaitForUser
+            ? "(已进入睡眠模式，将保持安静，直到主人发来消息才恢复。"
+            : $"(已进入睡眠模式，将在 {sleepUntil:yyyy-MM-dd HH:mm} 自动睡醒。");
+        sb.Append("睡眠期间不会主动打扰，群聊消息也会静默处理)");
+        if (invalidTime)
+            sb.Append(usedDefaultDuration
+                ? $"\n(注意：唤醒时间「{wakeupTime}」无法识别，已改用默认睡眠时长 {Configuration.SleepDefaultHours} 小时 {Configuration.SleepDefaultMinutes} 分钟；下次请用 ISO-8601、yyyy-MM-dd HH:mm、HH:mm 或 90m/2h 这类格式)"
+                : $"\n(注意：唤醒时间「{wakeupTime}」无法识别，本次已改为等待主人发消息唤醒；下次请用 ISO-8601、yyyy-MM-dd HH:mm、HH:mm 或 90m/2h 这类格式)");
+        interactor.Poke(sb.ToString());
+    }
+
+    /// <summary>
+    /// 解析唤醒时间，容忍模型常见的几种写法：
+    /// ISO-8601 / "yyyy-MM-dd HH:mm" / 纯时刻 "HH:mm"（已过则按明天） / 相对时长 "90m"、"2h"、"1h30m"。
+    /// 解析失败返回 null（由调用方决定回退默认时长并提示 AI）。
+    /// </summary>
+    static DateTime? ParseWakeupTime(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+        text = text.Trim();
+
+        //相对时长
+        {
+            System.Text.RegularExpressions.Match match =
+                System.Text.RegularExpressions.Regex.Match(text, @"^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (match.Success && (match.Groups[1].Success || match.Groups[2].Success))
+            {
+                int hours = match.Groups[1].Success ? int.Parse(match.Groups[1].Value) : 0;
+                int minutes = match.Groups[2].Success ? int.Parse(match.Groups[2].Value) : 0;
+                if (hours + minutes > 0)
+                    return DateTime.Now.AddHours(hours).AddMinutes(minutes);
+            }
+        }
+
+        //裸数字：按分钟理解（模型偶尔会把时长塞进 wakeupTime）
+        if (int.TryParse(text, out int bareMinutes) && bareMinutes > 0)
+            return DateTime.Now.AddMinutes(bareMinutes);
+
+        //纯时刻：今天该时刻，已过则明天
+        if (DateTime.TryParseExact(text, ["H:mm", "HH:mm", "H:mm:ss", "HH:mm:ss"],
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime timeOnly))
+        {
+            DateTime today = DateTime.Today.Add(timeOnly.TimeOfDay);
+            return today > DateTime.Now ? today : today.AddDays(1);
+        }
+
+        //完整日期时间
+        if (DateTime.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime parsed)
+            || DateTime.TryParse(text, CultureInfo.CurrentCulture, DateTimeStyles.AllowWhiteSpaces, out parsed))
+            return parsed;
+
+        return null;
+    }
+
+    /// <summary>清空睡眠状态（不发任何提示，提示由调用方决定是否附加）</summary>
+    void EndSleepState()
+    {
+        sleepUntil = null;
+        sleepWaitForUser = false;
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -1446,12 +1669,12 @@ public class SystemEventBoostService(
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("等待几秒再继续")]
-    public async Task Await([Description("等待秒数")] int second)
+    public async Task Await([Description("等待秒数")] int second, CancellationToken cancellationToken)
     {
         if (second > 60)
             throw new Exception($"不支持等待超过60秒，长时间等待请使用<{nameof(Awake)}>模拟");
 
-        await Task.Delay(second * 1000);
+        await Task.Delay(second * 1000, cancellationToken);
         interactor.Poke("AWait已完成");
     }
 
@@ -1606,13 +1829,13 @@ public class SystemEventBoostService(
 
     void WakeUp(bool silent)
     {
-        if (IsSleeping == false)
+        if (IsSleeping == false && sleepWakePending == false)
             return;
-        sleepUntil = null;
-        sleepWaitForUser = false;
+        EndSleepState();
+        sleepWakePending = false;
         nextActivityTime = DateTime.Now.AddSeconds(5);
         if (silent == false)
-            interactor.Poke("(已唤醒，恢复正常自主活动)");
+            interactor.Poke(Configuration.SleepWakePrompt?.Trim() ?? "(已睡醒，恢复正常自主活动)");
     }
 
     /// <summary>
@@ -1683,6 +1906,12 @@ public class SystemEventBoostService(
         if (IsSleeping)
         {
             nextActivityTime = DateTime.Now.AddSeconds(10); //睡眠期间由 TickActivity 持续轮询刷新
+            lastScheduleTime = DateTime.Now;
+            return;
+        }
+        if (sleepWakePending)
+        {
+            nextActivityTime = DateTime.Now; //睡醒提示待发：立刻排一轮，别被新配置的间隔推迟
             lastScheduleTime = DateTime.Now;
             return;
         }
@@ -1825,7 +2054,7 @@ public class SystemEventBoostService(
         try
         {
             using HttpClient client = new() { Timeout = TimeSpan.FromSeconds(6) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("Alife-SystemEventBoost/4.6.0");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Alife-SystemEventBoost/5.0.0");
             string json = await client.GetStringAsync($"https://timor.tech/api/holiday/year/{year}");
             Dictionary<string, HolidayRange> fetched = ParseHolidayJson(json);
             if (fetched.Count == 0)

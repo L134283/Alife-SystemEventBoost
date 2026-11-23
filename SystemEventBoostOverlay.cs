@@ -44,7 +44,7 @@ public readonly record struct OverlayCharSnapshot
 
 /// <summary>
 /// 倒计时挂件的角色注册表（静态）。
-/// 4.6.0 起挂件改为框架 globalUI 全局 Blazor 组件渲染（见 <see cref="CountdownOverlayWidget"/>），
+/// 挂件由框架 globalUI 全局 Blazor 组件渲染（见 <see cref="CountdownOverlayWidget"/>），
 /// 本类只保留"角色名 → 模块实例"的注册与快照生成：
 /// 不再有本地 HTTP 服务、端口、令牌、心跳与 ElectronNET 注入注入，故障面大幅缩小。
 /// </summary>

@@ -52,7 +52,7 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         以官方主动事件机制为基础进行增强，让 AI 的自主活动更聪明、更懂主人：
         - 定时任务：循环任务（每天/每周几）+ 临时任务（N 分钟后触发），让 AI 定时做任何事
         - 游戏陪伴模式：固定间隔查看屏幕游戏画面，给予鼓励与建议
-        - 睡眠模式：设定时间内不再主动活动，直到主人发消息或倒计时结束
+        - 睡眠模式：设定时间内不再主动活动，到点自动睡醒；若主人在睡眠中先发消息，睡醒提示会直接并入那条消息（不会多出一轮提醒）
         - DeepSeek 峰谷模式：高峰时段自动停止自主活跃，节省资源
         - 勿扰模式：AI 自主活动但不打扰主人（禁止 speak/qchat 标签）
         - 撒娇模式：更粘人主动找主人，可联动桌宠吸引注意
@@ -98,6 +98,10 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
     /// <summary>当前角色是否仍启用了官方「主动事件」插件（功能重叠，会导致双套周期报点）</summary>
     bool HasOfficialSystemEvent =>
         Character?.Modules?.Contains("Alife.Function.SystemEvent.SystemEventService") ?? false;
+
+    /// <summary>当前角色是否启用了官方 5.x「定时任务」插件（同名 Awake/Await，本插件会自动让位）</summary>
+    bool HasOfficialTimedTask =>
+        Character?.Modules?.Contains("Alife.Function.SystemEvent.TimedTaskService") ?? false;
 
     /// <summary>是否处于角色配置上下文（Character 非空）</summary>
     bool IsCharacterContext => Character != null;
@@ -509,6 +513,25 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
             __builder.CloseElement();
         }
 
+        // ========== 官方「定时任务」插件共存状态（5.x 新插件） ==========
+        if (HasOfficialTimedTask)
+        {
+            __builder.OpenElement(s++, "div");
+            __builder.AddAttribute(s++, "style", "margin-top:14px;");
+            __builder.OpenComponent<Alert>(s++);
+            __builder.AddComponentParameter(s++, "Type", RuntimeHelpers.TypeCheck((AlertType?)AlertType.Info));
+            __builder.AddComponentParameter(s++, "ShowIcon", true);
+            __builder.AddComponentParameter(s++, "Style", "border-radius:14px;border-color:#91caff;background:#e6f4ff;");
+            __builder.AddAttribute(s++, "ChildContent", (RenderFragment)((b) =>
+            {
+                b.AddContent(0, "ℹ️ 已启用官方 5.x「定时任务」插件：它的 <Awake>/<Await> 与本插件同名，"
+                    + "为避免同名函数被执行两次（双倍报点），本插件已自动让出这两个函数，由官方实现负责；"
+                    + "本插件的定时提醒请继续用 <CreateScheduledTask>/<CreateOneTimeTask>（触发后自动清理、不受此影响）。");
+            }));
+            __builder.CloseComponent();
+            __builder.CloseElement();
+        }
+
         // ========== 实时状态卡片（距下次报点倒计时 + 当前调度状态） ==========
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "style", "margin-top:14px;");
@@ -770,6 +793,25 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.CloseElement();
         __builder.CloseElement();
         RenderSwitch(__builder, ref s, Configuration.ImplicitInjection, v => Configuration.ImplicitInjection = v);
+        __builder.CloseElement();
+
+        // 闲时行动建议预注入（对齐官方 5.x 同名开关）
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-row");
+        __builder.AddAttribute(s++, "style", "margin-top:14px;padding-top:14px;border-top:1px dashed #f0d7e6;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "flex:1;");
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "font-weight:600;color:#7c2d5a;");
+        __builder.AddContent(s++, "闲时行动建议预注入（省 token）");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddAttribute(s++, "style", "margin:4px 0 0 0;");
+        __builder.AddContent(s++, "开启（默认，对齐官方 5.x）：把「周期报点」提示词一次性注入系统提示词，报点消息只写「请参考【闲时行动建议】」；关闭：每次报点都内联提示词，引导更强但更费 token。自定义报点模式始终内联自己的提示词。改动需重载插件生效。");
+        __builder.CloseElement();
+        __builder.CloseElement();
+        RenderSwitch(__builder, ref s, Configuration.UpdatePromptPreInject, v => Configuration.UpdatePromptPreInject = v);
         __builder.CloseElement();
         __builder.CloseElement();
 
@@ -1295,7 +1337,7 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         // 睡眠模式
         __builder.OpenElement(s++, "div");
         __builder.AddAttribute(s++, "class", "seb-card");
-        RenderModeHeader(__builder, ref s, "sleep", "睡眠", "设定时间内 AI 不再主动活动，直到主人发消息或倒计时结束，由 AI 按需进入", true, Configuration.MasterSleepMode, null);
+        RenderModeHeader(__builder, ref s, "sleep", "睡眠", "设定时间内 AI 不再主动活动，到点自动睡醒；主人在睡眠中先发消息则本轮即醒，由 AI 按需进入", true, Configuration.MasterSleepMode, null);
         if (SectionOpen("sleep", Configuration.MasterSleepMode))
         {
         __builder.OpenElement(s++, "div");
@@ -1330,6 +1372,21 @@ public partial class SystemEventBoostServiceUI : ModuleUIBase<SystemEventBoostSe
         __builder.AddComponentParameter(s++, "Rows", 3u);
         __builder.AddComponentParameter(s++, "Value", Configuration.SleepGroupSilencePrompt);
         __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.SleepGroupSilencePrompt = v));
+        __builder.CloseComponent();
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "style", "margin-top:12px;");
+        __builder.OpenElement(s++, "span");
+        __builder.AddAttribute(s++, "class", "seb-label");
+        __builder.AddContent(s++, "睡醒提示文本");
+        __builder.CloseElement();
+        __builder.OpenElement(s++, "div");
+        __builder.AddAttribute(s++, "class", "seb-desc");
+        __builder.AddContent(s++, "到点自动睡醒时随本轮报点一起发出；若主人在睡眠期间先发消息，则直接追加到主人那条消息末尾——只出现一次，不会在回复后再补一轮「已睡醒」。");
+        __builder.CloseElement();
+        __builder.OpenComponent<Input<string>>(s++);
+        __builder.AddComponentParameter(s++, "Value", Configuration.SleepWakePrompt);
+        __builder.AddComponentParameter(s++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.SleepWakePrompt = v));
         __builder.CloseComponent();
         __builder.CloseElement();
         }

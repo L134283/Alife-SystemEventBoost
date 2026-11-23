@@ -218,6 +218,14 @@ public class SystemEventBoostServiceConfig
     public string? UpdatePrompt { get; set; } =
         "(如果你手头还有事情，请继续。否则你可以自由活动，比如主动找主人玩，或看新闻学知识、发起新话题、偷窥主人屏幕、去Q群找人聊天玩耍，等各种你能想象到的事)";
 
+    /// <summary>
+    /// 闲时行动建议预注入（对齐官方 5.x 的同名开关）：
+    /// 开启（默认）时把报点提示词一次性注入系统提示词，报点消息只写「请参考【闲时行动建议】」，省 token；
+    /// 关闭时每次报点都把提示词内联进报点消息，引导更强但更费 token。
+    /// 自定义报点模式始终内联该模式自己的提示词。改动需重载插件生效。
+    /// </summary>
+    public bool UpdatePromptPreInject { get; set; } = true;
+
     /// <summary>周期报点基础间隔（秒）</summary>
     public int UpdateInterval { get; set; } = 90;
     /// <summary>周期报点随机偏移（秒）</summary>
@@ -322,6 +330,12 @@ public class SystemEventBoostServiceConfig
     public int SleepDefaultMinutes { get; set; }
     /// <summary>睡眠期间是否不回复群聊信息</summary>
     public bool SleepSilentGroup { get; set; } = true;
+    /// <summary>
+    /// 睡醒提示文本。只在两个时机出现一次：
+    /// ① 到点自动睡醒：随本轮报点一起发出；
+    /// ② 主人在睡眠期间先发消息：直接并入主人那条消息（追加在消息末尾），不再单独多一轮提醒。
+    /// </summary>
+    public string SleepWakePrompt { get; set; } = "(已睡醒，恢复正常自主活动)";
     /// <summary>睡眠期间群聊消息的静默占位文本（会替换原始群聊消息，强约束 AI 不回复）</summary>
     public string SleepGroupSilencePrompt { get; set; } =
         "[系统] 主人正在休息（睡眠模式中）。请忽略本条群聊消息，保持绝对安静：不要执行任何动作、不要调用任何功能、不要发送任何消息。如果模型必须输出回复，请只输出一个不包含任何标签的裸文本逗号「,」。";

@@ -12,9 +12,9 @@ using Microsoft.JSInterop;
 namespace Alife.Plugin.SystemEventBoost;
 
 /// <summary>
-/// 对话窗口倒计时挂件（框架 4.5.0 的 globalUI 全局渲染项，<see cref="ModuleAttribute.GlobalUI"/>）。
+/// 对话窗口倒计时挂件（框架 5.x 的 globalUI 全局渲染项，<see cref="ModuleAttribute.GlobalUI"/>）。
 ///
-/// 与 4.5.x 的旧实现相比彻底换掉了「ElectronNET 注入 JS + 本地 HTTP 服务 + 端口/令牌/心跳」那套：
+/// 与旧实现相比彻底换掉了「ElectronNET 注入 JS + 本地 HTTP 服务 + 端口/令牌/心跳」那套：
 /// - 数据直接来自 <see cref="CountdownOverlayManager"/> 里注册的模块实例，没有序列化/网络往返；
 /// - 渲染由 Blazor 负责，没有 Shadow DOM 手工重建、没有 fetch 失败自愈、没有 IPC 应答竞争；
 /// - JS 仅在「拖拽时量一次胶囊矩形/视口」和「探测其它插件挂件做避让」时使用，全部 try/catch 兜底，
